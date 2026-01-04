@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: General discussion / questions
+    url: https://github.com/CoDrazen/nms-corvette-build-share-tool/discussions
+    about: Ask questions or share general feedback here
