@@ -1,52 +1,32 @@
 ---
-
 name: Testing feedback / Bug report
-
-about: Report testing results or issues with the Corvette Build Share Tool
-
-title: "\[Feedback] "
-
-labels: feedback
-
-assignees: ""
-
+about: Report issues, test results, or compatibility feedback
+title: "[TESTING] "
+labels: testing
+assignees: ''
 ---
 
+## Platform
+- Game version (Steam / GOG / Microsoft / Switch / PlayStation):
+- OS (Windows version):
 
+## What were you trying to do?
+Describe what you attempted (export, import, specific Corvette, etc.)
 
-\*\*Platform\*\*
+## What happened?
+What actually occurred?
 
-(Steam / GOG / Microsoft Store / PlayStation / Switch)
+## Expected behavior
+What did you expect to happen?
 
+## Did it work partially?
+- [ ] Export works
+- [ ] Import works
+- [ ] Save loads correctly
+- [ ] Corvette build appears in-game
 
+## Logs / errors (if any)
+Paste error messages or screenshots here.
 
-\*\*Windows version\*\*
-
-(Windows 10 / Windows 11)
-
-
-
-\*\*What did you try to do?\*\*
-
-(Export / Import / Both)
-
-
-
-\*\*Result\*\*
-
-(Worked / Partially worked / Failed)
-
-
-
-\*\*Details\*\*
-
-(Any error messages, warnings, or unexpected behavior)
-
-
-
-\*\*Additional notes\*\*
-
-(Optional)
-
-
-
+## Additional notes
+Anything else that might help.
