@@ -1,3 +1,32 @@
+-------------------
+TESTING & FEEDBACK
+-------------------
+
+This tool is currently in a TESTING phase.
+
+It has been fully tested on:
+- Windows 10 / 11
+- Steam version of No Man’s Sky
+
+Feedback from users on other platforms is especially valuable:
+- GOG
+- Microsoft Store
+- PlayStation save imports
+- Switch save imports
+
+If you test this tool, please report:
+- Your platform (Steam / GOG / Microsoft / PS / Switch)
+- Whether export worked
+- Whether import worked
+- Any errors or warnings shown
+- Anything unexpected or unclear
+
+You can report feedback or issues here:
+https://github.com/CoDrazen/nms-corvette-build-share-tool/issues
+
+Even a simple “works fine on my setup” is helpful.
+
+
 -----------------------------
 NMS Corvette Build Share Tool
 -----------------------------
