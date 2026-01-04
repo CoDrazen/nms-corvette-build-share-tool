@@ -5,7 +5,7 @@ TESTING & FEEDBACK
 This tool is currently in a TESTING phase.
 
 It has been fully tested on:
-- Windows 10 / 11
+- Windows 11
 - Steam version of No Man’s Sky
 
 Feedback from users on other platforms is especially valuable:
