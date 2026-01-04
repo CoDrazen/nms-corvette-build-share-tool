@@ -4,7 +4,7 @@ TESTING & FEEDBACK
 
 This tool is currently in a TESTING phase.
 
-It has been fully tested on:
+It has been tested on:
 - Windows 11
 - Steam version of No Man’s Sky
 
