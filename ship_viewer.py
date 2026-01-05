@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import tkinter as tk
+import threading
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
 from datetime import datetime, timezone
@@ -174,7 +175,7 @@ def _windows_no_console_startupinfo():
 
 
 def _run_libnom(args: list[str], cwd: str | None = None, input_text: str | None = None) -> str:
-    """
+    r"""
     Portable runner:
       1) Prefer bundled EXE:  <app>\libNOM\libNOM.io.cli.exe
       2) Optional fallback:  dotnet <app>\libNOM\libNOM.io.cli.dll
@@ -190,8 +191,6 @@ def _run_libnom(args: list[str], cwd: str | None = None, input_text: str | None 
         raise FileNotFoundError(
             "libNOM CLI not found.\n\n"
             f"Expected EXE:\n  {LIBNOM_EXE}\n\n"
-            "Optional DLL fallback:\n"
-            f"  {LIBNOM_DLL}\n\n"
             "Fix: put libNOM.io.cli.exe inside the app's libNOM folder."
         )
 
@@ -824,13 +823,22 @@ class ExportTab(ttk.Frame):
         top = ttk.Frame(self)
         top.pack(fill="x")
 
+        # busy flag
+        self._busy = False
+
         ttk.Button(top, text="Choose SAVE Folder (Export)", command=self.choose_folder).pack(side="left")
         ttk.Label(top, textvariable=self.save_folder).pack(side="left", padx=10)
 
-        ttk.Button(top, text="Convert + Load Corvettes", command=self.convert_and_load).pack(side="left", padx=10)
+        self.convert_btn = ttk.Button(top, text="Convert + Load Corvettes", command=self.convert_and_load)
+        self.convert_btn.pack(side="left", padx=10)
 
         self.export_btn = ttk.Button(top, text="Export Build", command=self.export_selected, state="disabled")
         self.export_btn.pack(side="left", padx=10)
+
+        # status label (right side of the top row)
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(top, textvariable=self.status_var).pack(side="right")
+
 
         mid = ttk.Frame(self)
         mid.pack(fill="x", pady=(10, 0))
@@ -857,6 +865,24 @@ class ExportTab(ttk.Frame):
             selectforeground="#ffffff"
         )
 
+    def _set_busy(self, busy: bool, status: str | None = None):
+        self._busy = busy
+        if status is not None:
+            self.status_var.set(status)
+
+        # Disable/enable convert button while working
+        self.convert_btn.config(state="disabled" if busy else "normal")
+
+        # Export button should stay disabled while busy
+        if busy:
+            self.export_btn.config(state="disabled")
+
+        # Cursor feedback (watch cursor)
+        try:
+            self.root_app.configure(cursor="watch" if busy else "")
+            self.root_app.update_idletasks()
+        except Exception:
+            pass
 
     def choose_folder(self):
         folder = filedialog.askdirectory(title="Select your NMS SAVE folder to EXPORT from (contains save2.hg)")
@@ -889,79 +915,127 @@ class ExportTab(ttk.Frame):
         self.ship_combo["values"] = []
         self.export_btn.config(state="disabled")
         self.text.delete("1.0", tk.END)
+        self.status_var.set("Ready.")
 
     def convert_and_load(self):
+        if self._busy:
+            return
+
         folder = self.save_folder.get().strip()
         if not folder:
             messagebox.showerror("Missing folder", "Choose the export save folder first.", parent=self)
             return
 
+        # Fast fail: libNOM must exist before we spawn the worker thread
+        if not os.path.isfile(LIBNOM_EXE):
+            messagebox.showerror(
+                "libNOM missing",
+                "libNOM CLI not found.\n\n"
+                f"Expected:\n{LIBNOM_EXE}\n\n"
+                "Fix: put libNOM.io.cli.exe inside the app's libNOM folder.",
+                parent=self
+            )
+            return
+        
         d = ensure_tool_dirs_for_save(folder)
         self._set_workspace_from_dict(d)
 
         if not pre_convert_warning_gate(self):
             return
 
-        try:
-            self.platform_format = detect_platform_format_from_savehg(folder)
+        # prevent stale UI while converting
+        self.export_btn.config(state="disabled")
+        self.ship_combo["values"] = []
+        self.text.delete("1.0", tk.END)
 
-            out_json = run_convert_save2hg_to_json(folder, self.export_work_dir, self.save_id)
-            self.json_path.set(out_json)
+        self._set_busy(True, "Converting save to JSON…")
 
-            with open(out_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        def worker():
+            try:
+                platform_format = detect_platform_format_from_savehg(folder)
+                self.after(0, lambda: self.status_var.set(f"Detected platform: {platform_format} — Converting save to JSON…"))
+                
+                # Phase 1: convert
+                out_json = run_convert_save2hg_to_json(folder, self.export_work_dir, self.save_id)
 
-            self.last_loaded_root = data
+                # Phase 2: load json
+                self.after(0, lambda: self.status_var.set("Loading JSON…"))
+                with open(out_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
 
-            ship_bases = find_player_ship_bases(data)
-            if not ship_bases:
-                messagebox.showwarning(
-                    "No corvettes found",
-                    "Converted JSON loaded, but no Corvette bases were found at:\n"
-                    "BaseContext → PlayerStateData → PersistentPlayerBases (BaseType=PlayerShipBase)",
-                    parent=self
-                )
-                self._clear_loaded_state()
-                return
+                # Phase 3: scan + pair
+                self.after(0, lambda: self.status_var.set("Scanning corvettes…"))
+                ship_bases = find_player_ship_bases(data)
+                if not ship_bases:
+                    raise RuntimeError(
+                        "Converted JSON loaded, but no Corvette bases were found at:\n"
+                        "BaseContext → PlayerStateData → PersistentPlayerBases (BaseType=PlayerShipBase)"
+                    )
 
-            info_by_base_index = pair_bases_to_corvette_info(data, ship_bases)
+                info_by_base_index = pair_bases_to_corvette_info(data, ship_bases)
 
-            primary_i = get_primary_ship_index(data)
-            active_res = get_shipownership_resource(data, primary_i) if primary_i is not None else {}
-            self.active_seed = resource_seed_hex(active_res)
+                primary_i = get_primary_ship_index(data)
+                active_res = get_shipownership_resource(data, primary_i) if primary_i is not None else {}
+                active_seed = resource_seed_hex(active_res)
 
-            self.ship_bases = ship_bases
-            self.ship_labels = []
-            self.ship_names_only = []
-            self.ship_seeds = []
+                labels, names_only, seeds = [], [], []
+                for i, b in enumerate(ship_bases):
+                    info = info_by_base_index.get(i)
+                    if info:
+                        nm = info["name"]
+                        seed = info["seed"]
+                    else:
+                        ga = b.get("GalacticAddress")
+                        nm = "Corvette (Unknown)" + (f" @ {ga}" if isinstance(ga, int) else "")
+                        seed = ""
 
-            for i, b in enumerate(self.ship_bases):
-                info = info_by_base_index.get(i)
-                if info:
-                    nm = info["name"]
-                    seed = info["seed"]
-                else:
-                    ga = b.get("GalacticAddress")
-                    nm = "Corvette (Unknown)" + (f" @ {ga}" if isinstance(ga, int) else "")
-                    seed = ""
+                    obj_count = len(get_base_objects(b))
+                    is_active = (seed and active_seed and seed.lower() == active_seed.lower())
+                    active_tag = " [ACTIVE]" if is_active else ""
 
-                obj_count = len(get_base_objects(b))
-                is_active = (seed and self.active_seed and seed.lower() == self.active_seed.lower())
-                active_tag = " [ACTIVE]" if is_active else ""
+                    labels.append(f"{i+1}. {nm}{active_tag}  (Objects: {obj_count})")
+                    names_only.append(nm)
+                    seeds.append(seed)
 
-                self.ship_labels.append(f"{i+1}. {nm}{active_tag}  (Objects: {obj_count})")
-                self.ship_names_only.append(nm)
-                self.ship_seeds.append(seed)
+                # UI update (must be in main thread)
+                def on_success():
+                    self.platform_format = platform_format
+                    self.json_path.set(out_json)
+                    self.last_loaded_root = data
+                    self.active_seed = active_seed
 
-            self.ship_combo["values"] = self.ship_labels
-            self.ship_combo.current(0)
-            self.export_btn.config(state="normal")
-            self.on_ship_selected()
+                    self.ship_bases = ship_bases
+                    self.ship_labels = labels
+                    self.ship_names_only = names_only
+                    self.ship_seeds = seeds
 
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Convert failed", f"libNOM failed.\n\n{e}", parent=self)
-        except Exception as e:
-            messagebox.showerror("Error", str(e), parent=self)
+                    self.ship_combo["values"] = self.ship_labels
+                    self.ship_combo.current(0)
+
+                    self.export_btn.config(state="normal")
+                    self.on_ship_selected()
+
+                    self._set_busy(False, "Ready.")
+
+                self.after(0, on_success)
+
+            except subprocess.CalledProcessError as e:
+                def on_fail():
+                    stdout = (getattr(e, "stdout", "") or "").strip()
+                    stderr = (getattr(e, "stderr", "") or "").strip()
+                    details = "\n\n".join([t for t in (stdout, stderr) if t]) or str(e)
+                    messagebox.showerror("Convert failed", "libNOM failed.\n\n" + details, parent=self)
+                    self._set_busy(False, "Ready.")
+                self.after(0, on_fail)
+
+            except Exception as e:
+                def on_fail2():
+                    messagebox.showerror("Error", str(e), parent=self)
+                    self._set_busy(False, "Ready.")
+                self.after(0, on_fail2)
+
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def on_ship_selected(self, *_):
         idx = self.ship_combo.current()
@@ -1099,13 +1173,19 @@ class ImportTab(ttk.Frame):
         top = ttk.Frame(self)
         top.pack(fill="x")
 
+        self._busy = False
+        
         ttk.Button(top, text="Choose TARGET Save Folder (Import)", command=self.choose_folder).pack(side="left")
         ttk.Label(top, textvariable=self.save_folder).pack(side="left", padx=10)
 
-        ttk.Button(top, text="Convert + Load Corvettes", command=self.convert_and_load).pack(side="left", padx=10)
+        self.convert_btn = ttk.Button(top, text="Convert + Load Corvettes", command=self.convert_and_load)
+        self.convert_btn.pack(side="left", padx=10)
 
         self.import_btn = ttk.Button(top, text="Import Build (Replace)", command=self.import_into_selected, state="disabled")
         self.import_btn.pack(side="left", padx=10)
+
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(top, textvariable=self.status_var).pack(side="right")
 
         mid = ttk.Frame(self)
         mid.pack(fill="x", pady=(10, 0))
@@ -1131,7 +1211,27 @@ class ImportTab(ttk.Frame):
             selectbackground="#404040",
             selectforeground="#ffffff"
         )
-        
+
+    def _set_busy(self, busy: bool, status: str | None = None):
+        self._busy = busy
+        if status is not None:
+            self.status_var.set(status)
+
+        self.convert_btn.config(state="disabled" if busy else "normal")
+
+        # Import button must stay disabled while busy
+        if busy:
+            self.import_btn.config(state="disabled")
+
+        try:
+            self.root_app.configure(cursor="watch" if busy else "")
+            self.root_app.update_idletasks()
+        except Exception:
+            pass
+
+        if not busy and isinstance(self.last_loaded_root, dict) and self.ship_bases:
+            self.import_btn.config(state="normal")
+
 
     def choose_folder(self):
         folder = filedialog.askdirectory(title="Select your TARGET NMS save folder to IMPORT into (contains save2.hg)")
@@ -1162,11 +1262,26 @@ class ImportTab(ttk.Frame):
         self.ship_combo["values"] = []
         self.import_btn.config(state="disabled")
         self.text.delete("1.0", tk.END)
+        self.status_var.set("Ready.")
 
     def convert_and_load(self):
+        if self._busy:
+            return
+
         folder = self.save_folder.get().strip()
         if not folder:
             messagebox.showerror("Missing folder", "Choose the target save folder first.", parent=self)
+            return
+
+        # Fast fail: libNOM must exist before we spawn the worker thread
+        if not os.path.isfile(LIBNOM_EXE):
+            messagebox.showerror(
+                "libNOM missing",
+                "libNOM CLI not found.\n\n"
+                f"Expected:\n{LIBNOM_EXE}\n\n"
+                "Fix: put libNOM.io.cli.exe inside the app's libNOM folder.",
+                parent=self
+            )
             return
 
         d = ensure_tool_dirs_for_save(folder)
@@ -1175,66 +1290,98 @@ class ImportTab(ttk.Frame):
         if not pre_convert_warning_gate(self):
             return
 
-        try:
-            self.platform_format = detect_platform_format_from_savehg(folder)
+        # prevent stale UI while converting
+        self.import_btn.config(state="disabled")
+        self.ship_combo["values"] = []
+        self.text.delete("1.0", tk.END)
 
-            out_json = run_convert_save2hg_to_json(folder, self.import_work_dir, self.save_id)
-            self.json_path.set(out_json)
+        self._set_busy(True, "Converting save to JSON…")
 
-            with open(out_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        def worker():
+            try:
+                platform_format = detect_platform_format_from_savehg(folder)
+                self.after(0, lambda: self.status_var.set(f"Detected platform: {platform_format} — Converting save to JSON…"))
 
-            self.last_loaded_root = data
+                # Phase 1: convert
+                out_json = run_convert_save2hg_to_json(folder, self.import_work_dir, self.save_id)
 
-            ship_bases = find_player_ship_bases(data)
-            if not ship_bases:
-                messagebox.showwarning(
-                    "No corvettes found",
-                    "Converted JSON loaded, but no Corvette bases were found at:\n"
-                    "BaseContext → PlayerStateData → PersistentPlayerBases (BaseType=PlayerShipBase)",
-                    parent=self
-                )
-                self._clear_loaded_state()
-                return
+                # Phase 2: load json
+                self.after(0, lambda: self.status_var.set("Loading JSON…"))
+                with open(out_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
 
-            info_by_base_index = pair_bases_to_corvette_info(data, ship_bases)
+                # Phase 3: scan + pair
+                self.after(0, lambda: self.status_var.set("Scanning corvettes…"))
+                ship_bases = find_player_ship_bases(data)
+                if not ship_bases:
+                    raise RuntimeError(
+                        "Converted JSON loaded, but no Corvette bases were found at:\n"
+                        "BaseContext → PlayerStateData → PersistentPlayerBases (BaseType=PlayerShipBase)"
+                    )
 
-            primary_i = get_primary_ship_index(data)
-            active_res = get_shipownership_resource(data, primary_i) if primary_i is not None else {}
-            self.active_seed = resource_seed_hex(active_res)
+                info_by_base_index = pair_bases_to_corvette_info(data, ship_bases)
 
-            self.ship_bases = ship_bases
-            self.ship_labels = []
-            self.ship_names_only = []
-            self.ship_seeds = []
+                primary_i = get_primary_ship_index(data)
+                active_res = get_shipownership_resource(data, primary_i) if primary_i is not None else {}
+                active_seed = resource_seed_hex(active_res)
 
-            for i, b in enumerate(self.ship_bases):
-                info = info_by_base_index.get(i)
-                if info:
-                    nm = info["name"]
-                    seed = info["seed"]
-                else:
-                    ga = b.get("GalacticAddress")
-                    nm = "Corvette (Unknown)" + (f" @ {ga}" if isinstance(ga, int) else "")
-                    seed = ""
+                labels, names_only, seeds = [], [], []
+                for i, b in enumerate(ship_bases):
+                    info = info_by_base_index.get(i)
+                    if info:
+                        nm = info["name"]
+                        seed = info["seed"]
+                    else:
+                        ga = b.get("GalacticAddress")
+                        nm = "Corvette (Unknown)" + (f" @ {ga}" if isinstance(ga, int) else "")
+                        seed = ""
 
-                obj_count = len(get_base_objects(b))
-                is_active = (seed and self.active_seed and seed.lower() == self.active_seed.lower())
-                active_tag = " [ACTIVE]" if is_active else ""
+                    obj_count = len(get_base_objects(b))
+                    is_active = (seed and active_seed and seed.lower() == active_seed.lower())
+                    active_tag = " [ACTIVE]" if is_active else ""
 
-                self.ship_labels.append(f"{i+1}. {nm}{active_tag}  (Objects: {obj_count})")
-                self.ship_names_only.append(nm)
-                self.ship_seeds.append(seed)
+                    labels.append(f"{i+1}. {nm}{active_tag}  (Objects: {obj_count})")
+                    names_only.append(nm)
+                    seeds.append(seed)
 
-            self.ship_combo["values"] = self.ship_labels
-            self.ship_combo.current(0)
-            self.import_btn.config(state="normal")
-            self.on_ship_selected()
+                # UI update (must be in main thread)
+                def on_success():
+                    self.platform_format = platform_format
+                    self.json_path.set(out_json)
+                    self.last_loaded_root = data
+                    self.active_seed = active_seed
 
-        except subprocess.CalledProcessError as e:
-            messagebox.showerror("Convert failed", f"libNOM failed.\n\n{e}", parent=self)
-        except Exception as e:
-            messagebox.showerror("Error", str(e), parent=self)
+                    self.ship_bases = ship_bases
+                    self.ship_labels = labels
+                    self.ship_names_only = names_only
+                    self.ship_seeds = seeds
+
+                    self.ship_combo["values"] = self.ship_labels
+                    self.ship_combo.current(0)
+
+                    self.import_btn.config(state="normal")
+                    self.on_ship_selected()
+
+                    self._set_busy(False, "Ready.")
+
+                self.after(0, on_success)
+
+            except subprocess.CalledProcessError as e:
+                def on_fail():
+                    stdout = (getattr(e, "stdout", "") or "").strip()
+                    stderr = (getattr(e, "stderr", "") or "").strip()
+                    details = "\n\n".join([t for t in (stdout, stderr) if t]) or str(e)
+                    messagebox.showerror("Convert failed", "libNOM failed.\n\n" + details, parent=self)
+                    self._set_busy(False, "Ready.")
+                self.after(0, on_fail)
+
+            except Exception as e:
+                def on_fail2():
+                    messagebox.showerror("Error", str(e), parent=self)
+                    self._set_busy(False, "Ready.")
+                self.after(0, on_fail2)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def on_ship_selected(self, *_):
         idx = self.ship_combo.current()
@@ -1291,10 +1438,23 @@ class ImportTab(ttk.Frame):
         return True
 
     def import_into_selected(self):
+        if self._busy:
+            return
         folder = self.save_folder.get().strip()
         if not folder:
             messagebox.showerror("Missing folder", "Choose the target save folder first.", parent=self)
             return
+
+        if not os.path.isfile(LIBNOM_EXE):
+            messagebox.showerror(
+                "libNOM missing",
+                "libNOM CLI not found.\n\n"
+                f"Expected:\n{LIBNOM_EXE}\n\n"
+                "Fix: put libNOM.io.cli.exe inside the app's libNOM folder.",
+                parent=self
+            )
+            return
+        
         if not isinstance(self.last_loaded_root, dict):
             messagebox.showerror("Not loaded", "Convert + Load in the Import tab first.", parent=self)
             return
@@ -1325,6 +1485,7 @@ class ImportTab(ttk.Frame):
             return
 
         try:
+            self.status_var.set("Loading build file…")
             imported_objects, meta = parse_build_file(build_path)
         except Exception as e:
             messagebox.showerror("Invalid build file", str(e), parent=self)
@@ -1369,44 +1530,83 @@ class ImportTab(ttk.Frame):
             messagebox.showerror("Import failed", "Could not locate Objects[] in the selected Corvette base.", parent=self)
             return
 
+        # Apply build in memory (fast)
+        self.status_var.set("Applying build…")
         parent[key] = imported_objects
 
-        # Write modified root JSON to Work\Import\<save_id>, then convert back to save2.hg in save folder
-        try:
-            tmp_json = os.path.join(self.import_work_dir, "_corvette_tool_modified_save.json")
-            with open(tmp_json, "w", encoding="utf-8") as f:
-                json.dump(self.last_loaded_root, f, ensure_ascii=False)
+        # From this point, do the heavy writing/conversion in a background thread
+        self._set_busy(True, "Writing save…")
 
-            fmt = self.platform_format or detect_platform_format_from_savehg(folder)
+        # Copy the data we need into locals so the worker doesn't depend on UI state changing
+        root_to_write = self.last_loaded_root
+        work_dir = self.import_work_dir
+        platform_format = self.platform_format or detect_platform_format_from_savehg(folder)
+        save_folder = folder
 
-            convert_json_to_savehg(fmt, tmp_json, folder, self.import_work_dir, "save2.hg")
-            convert_json_to_savehg(fmt, tmp_json, folder, self.import_work_dir, "save.hg")
-
-
+        def worker_write():
+            tmp_json = os.path.join(work_dir, "_corvette_tool_modified_save.json")
             try:
-                os.remove(tmp_json)
-            except Exception:
-                pass
+                # Write modified JSON
+                with open(tmp_json, "w", encoding="utf-8") as f:
+                    json.dump(root_to_write, f, ensure_ascii=False)
 
-            messagebox.showinfo(
-                "Import complete",
-                "Build imported successfully!\n\n"
-                f"Backup created at:\n{backup_dir}\n\n"
-                "Next steps:\n"
-                "1) Launch the game\n"
-                "2) Load your save\n"
-                "3) Go to the Corvette and check the build",
-                parent=self
-            )
+                # Convert + write both saves
+                convert_json_to_savehg(platform_format, tmp_json, save_folder, work_dir, "save2.hg")
+                convert_json_to_savehg(platform_format, tmp_json, save_folder, work_dir, "save.hg")
 
-        except Exception as e:
-            messagebox.showerror(
-                "Write failed",
-                "Import replaced the Corvette objects in memory, but writing back to the save file(s) failed.\n\n"
-                f"Error: {e}\n\n"
-                f"Your backup is here:\n{backup_dir}",
-                parent=self
-            )
+                # Cleanup temp json
+                try:
+                    os.remove(tmp_json)
+                except Exception:
+                    pass
+
+                def on_success():
+                    self._set_busy(False, "Ready.")
+                    messagebox.showinfo(
+                        "Import complete",
+                        "Build imported successfully!\n\n"
+                        f"Backup created at:\n{backup_dir}\n\n"
+                        "Next steps:\n"
+                        "1) Launch the game\n"
+                        "2) Load your save\n"
+                        "3) Go to the Corvette and check the build",
+                        parent=self
+                    )
+
+                self.after(0, on_success)
+
+            except subprocess.CalledProcessError as e:
+                def on_fail_proc():
+                    # Show libNOM's real error text (stdout/stderr)
+                    stdout = (getattr(e, "stdout", "") or "").strip()
+                    stderr = (getattr(e, "stderr", "") or "").strip()
+                    details = "\n\n".join([t for t in (stdout, stderr) if t]) or str(e)
+
+                    self._set_busy(False, "Ready.")
+                    messagebox.showerror(
+                        "Write failed",
+                        "Writing back to the save file(s) failed.\n\n"
+                        f"{details}\n\n"
+                        f"Your backup is here:\n{backup_dir}",
+                        parent=self
+                    )
+
+                self.after(0, on_fail_proc)
+
+            except Exception as e:
+                def on_fail():
+                    self._set_busy(False, "Ready.")
+                    messagebox.showerror(
+                        "Write failed",
+                        "Writing back to the save file(s) failed.\n\n"
+                        f"Error: {e}\n\n"
+                        f"Your backup is here:\n{backup_dir}",
+                        parent=self
+                    )
+                self.after(0, on_fail)
+
+        threading.Thread(target=worker_write, daemon=True).start()
+
 
 
 if __name__ == "__main__":
