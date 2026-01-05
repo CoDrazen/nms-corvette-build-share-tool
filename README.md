@@ -124,3 +124,19 @@ This is a community-made tool.
 Not affiliated with Hello Games.
 
 No Man’s Sky is a trademark of Hello Games Ltd.
+
+
+-------
+LICENSE
+-------
+
+License: Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+(CC BY-NC-SA 4.0).
+
+You may use, modify, and share this tool freely for non-commercial purposes.
+Commercial use is not permitted without explicit permission from the author.
+
+If you use parts of this code, please credit:
+- CoDrazen
+- libNOM project
+- Weenzo (research inspiration)
