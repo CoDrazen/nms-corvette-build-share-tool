@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ BUILD_VERSION = 1
 # Tool workspace folder (created next to st_... save folder)
 TOOL_ROOT_NAME = "NMS_CorvetteTool"
 
+
 def apply_dark_theme(root: tk.Tk):
     """
     Simple dark theme for ttk + base Tk widgets.
@@ -34,14 +36,11 @@ def apply_dark_theme(root: tk.Tk):
 
     style = ttk.Style(root)
 
-    # Use a ttk theme that actually respects color changes
-    # (vista doesn't always obey bg changes, clam usually does)
     try:
         style.theme_use("clam")
     except Exception:
         pass
 
-    # Global defaults
     style.configure(".", background="#1e1e1e", foreground="#e6e6e6")
     style.configure("TFrame", background="#1e1e1e")
     style.configure("TLabel", background="#1e1e1e", foreground="#e6e6e6")
@@ -75,8 +74,118 @@ def apply_dark_theme(root: tk.Tk):
     style.configure("TNotebook.Tab", background="#2a2a2a", foreground="#e6e6e6", padding=(12, 6))
     style.map("TNotebook.Tab", background=[("selected", "#3a3a3a")])
 
-    # Optional: nicer separators if you use them
     style.configure("TSeparator", background="#333333")
+
+
+# -----------------------------
+# Save slot helpers
+# -----------------------------
+
+_SAVE_RE = re.compile(r"^save(\d*)\.hg$", re.IGNORECASE)
+
+def _save_num_from_name(name: str) -> int:
+    """
+    save.hg -> 1
+    save2.hg -> 2
+    save3.hg -> 3
+    ...
+    """
+    m = _SAVE_RE.match(name.strip())
+    if not m:
+        return -1
+    digits = m.group(1)
+    if not digits:
+        return 1
+    try:
+        return int(digits)
+    except Exception:
+        return -1
+
+
+def list_save_slots(save_folder: str) -> list[dict]:
+    """
+    Returns list of slots present in folder.
+    Slot mapping:
+      Slot 1: save.hg (1) + save2.hg (2)
+      Slot 2: save3.hg (3) + save4.hg (4)
+      Slot 3: save5.hg (5) + save6.hg (6)
+      ...
+    We consider a slot "present" if at least one of its pair files exists,
+    but we strongly prefer slots where BOTH exist.
+    """
+    try:
+        names = os.listdir(save_folder)
+    except Exception:
+        return []
+
+    present_nums = set()
+    for n in names:
+        k = _save_num_from_name(n)
+        if k > 0:
+            present_nums.add(k)
+
+    slots = []
+    # Slot 1 special
+    pair1 = (1, 2)
+    has1 = any(x in present_nums for x in pair1)
+    if has1:
+        slots.append({
+            "slot": 1,
+            "auto_num": 1,
+            "restore_num": 2,
+            "auto_file": "save.hg",
+            "restore_file": "save2.hg",
+            "both": (1 in present_nums and 2 in present_nums),
+        })
+
+    # Slot 2+ (odd/even pairs)
+    # Find max numeric save index
+    maxn = max(present_nums) if present_nums else 0
+    # slot n uses (2n-1, 2n) where n>=2
+    n = 2
+    while True:
+        a = 2 * n - 1
+        b = 2 * n
+        if a > maxn and b > maxn:
+            break
+        if a in present_nums or b in present_nums:
+            slots.append({
+                "slot": n,
+                "auto_num": a,
+                "restore_num": b,
+                "auto_file": f"save{a}.hg",
+                "restore_file": f"save{b}.hg",
+                "both": (a in present_nums and b in present_nums),
+            })
+        n += 1
+
+    # Prefer fully-present slots first, then slot order
+    slots.sort(key=lambda s: (0 if s["both"] else 1, s["slot"]))
+    return slots
+
+
+def slot_display_label(slot_info: dict) -> str:
+    s = slot_info["slot"]
+    a = slot_info["auto_file"]
+    r = slot_info["restore_file"]
+    suffix = "" if slot_info.get("both") else " (incomplete)"
+    return f"Slot {s}  [{a} + {r}]{suffix}"
+
+
+def mf_name_for_save(save_name: str) -> str:
+    """
+    save.hg      -> mf_save.hg
+    save2.hg     -> mf_save2.hg
+    save12.hg    -> mf_save12.hg
+    """
+    n = save_name.strip()
+    low = n.lower()
+    if not low.endswith(".hg"):
+        return "mf_" + n
+    stem = n[:-3]  # remove ".hg"
+    if stem.lower() == "save":
+        return "mf_save.hg"
+    return f"mf_{stem}.hg"
 
 
 # -----------------------------
@@ -127,17 +236,18 @@ def ensure_tool_dirs_for_save(save_folder: str) -> dict:
     }
 
 
-def stable_work_json_path(work_dir: str, save_id: str) -> str:
-    return os.path.join(work_dir, f"{save_id}.save2.hg.json")
+def stable_work_json_path(work_dir: str, save_id: str, slot_num: int) -> str:
+    # stable per-slot json filename
+    return os.path.join(work_dir, f"{save_id}.slot{slot_num}.save.json")
 
 
-def clean_work_json(work_dir: str, save_id: str) -> None:
+def clean_work_json(work_dir: str, save_id: str, slot_num: int) -> None:
     """
     Clean ONLY inside this slot-specific work_dir:
-      - delete stable JSON
-      - delete any leftover save2.hg.*.json produced by libNOM
+      - delete stable JSON for this slot
+      - delete any leftover save*.hg.*.json produced by libNOM
     """
-    stable = stable_work_json_path(work_dir, save_id)
+    stable = stable_work_json_path(work_dir, save_id, slot_num)
     try:
         if os.path.isfile(stable):
             os.remove(stable)
@@ -147,7 +257,7 @@ def clean_work_json(work_dir: str, save_id: str) -> None:
     try:
         for name in os.listdir(work_dir):
             low = name.lower()
-            if low.startswith("save2.hg.") and low.endswith(".json"):
+            if low.startswith("save") and low.endswith(".json") and ".hg." in low:
                 try:
                     os.remove(os.path.join(work_dir, name))
                 except Exception:
@@ -161,10 +271,6 @@ def clean_work_json(work_dir: str, save_id: str) -> None:
 # -----------------------------
 
 def _windows_no_console_startupinfo():
-    """
-    Hide console window for subprocess calls on Windows.
-    Returns (startupinfo, creationflags) or (None, 0) on non-Windows.
-    """
     if os.name != "nt":
         return None, 0
     startupinfo = subprocess.STARTUPINFO()
@@ -175,16 +281,8 @@ def _windows_no_console_startupinfo():
 
 
 def _run_libnom(args: list[str], cwd: str | None = None, input_text: str | None = None) -> str:
-    r"""
-    Portable runner:
-      1) Prefer bundled EXE:  <app>\libNOM\libNOM.io.cli.exe
-      2) Optional fallback:  dotnet <app>\libNOM\libNOM.io.cli.dll
-
-    Returns stdout+stderr (best-effort). Raises CalledProcessError on failure.
-    """
     startupinfo, creationflags = _windows_no_console_startupinfo()
 
-    # EXE portable
     if os.path.isfile(LIBNOM_EXE):
         cmd = [LIBNOM_EXE] + args
     else:
@@ -206,21 +304,20 @@ def _run_libnom(args: list[str], cwd: str | None = None, input_text: str | None 
         capture_output=True,
         check=True
     )
-
     return (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
 
 
-def run_convert_save2hg_to_json(save_folder: str, work_dir: str, save_id: str) -> str:
+def run_convert_savehg_to_json(save_folder: str, save_file_name: str, work_dir: str, save_id: str, slot_num: int) -> str:
     r"""
-    Converts <save_folder>\save2.hg to JSON, outputs into work_dir.
+    Converts <save_folder>\<save_file_name> to JSON, outputs into work_dir.
     Returns stable JSON path:
-      <work_dir>\<save_id>.save2.hg.json
+      <work_dir>\<save_id>.slot<slot_num>.save.json
     """
-    save_hg = os.path.join(save_folder, "save2.hg")
+    save_hg = os.path.join(save_folder, save_file_name)
     if not os.path.isfile(save_hg):
-        raise FileNotFoundError(f"save2.hg not found in: {save_folder}")
+        raise FileNotFoundError(f"{save_file_name} not found in: {save_folder}")
 
-    clean_work_json(work_dir, save_id)
+    clean_work_json(work_dir, save_id, slot_num)
 
     cmd = [
         "Convert",
@@ -237,20 +334,23 @@ def run_convert_save2hg_to_json(save_folder: str, work_dir: str, save_id: str) -
 
     created = sorted([f for f in (after - before) if f.lower().endswith(".json")])
     if not created:
+        # fallback: pick newest matching save*.hg.*.json
         candidates = [
             f for f in os.listdir(work_dir)
-            if f.lower().startswith("save2.hg.") and f.lower().endswith(".json")
+            if f.lower().startswith("save") and f.lower().endswith(".json") and ".hg." in f.lower()
         ]
         if not candidates:
             raise RuntimeError("Convert ran but no JSON was created/found in Work folder.")
         candidates.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
         created_path = os.path.join(work_dir, candidates[0])
     else:
-        created_save2hg = [f for f in created if f.lower().startswith("save2.hg.")]
-        pick = created_save2hg[0] if created_save2hg else created[0]
+        # prefer json whose prefix matches the input save file
+        prefix = save_file_name.lower() + "."
+        match = [f for f in created if f.lower().startswith(prefix)]
+        pick = match[0] if match else created[0]
         created_path = os.path.join(work_dir, pick)
 
-    stable_path = stable_work_json_path(work_dir, save_id)
+    stable_path = stable_work_json_path(work_dir, save_id, slot_num)
     try:
         if os.path.abspath(created_path) != os.path.abspath(stable_path):
             if os.path.isfile(stable_path):
@@ -265,17 +365,24 @@ def run_convert_save2hg_to_json(save_folder: str, work_dir: str, save_id: str) -
     return stable_path
 
 
-def detect_platform_format_from_savehg(save_folder: str) -> str:
-    # Strong Steam hint
+def detect_platform_format_from_savehg(save_folder: str, preferred_save_file: str) -> str:
     if os.path.isfile(os.path.join(save_folder, "steam_autocloud.vdf")):
         return "Steam"
 
-    save_hg = os.path.join(save_folder, "save2.hg")
-    if not os.path.isfile(save_hg):
+    candidate = os.path.join(save_folder, preferred_save_file)
+    if not os.path.isfile(candidate):
+        # fallback to any existing save file
+        for alt in ("save2.hg", "save.hg"):
+            ap = os.path.join(save_folder, alt)
+            if os.path.isfile(ap):
+                candidate = ap
+                break
+
+    if not os.path.isfile(candidate):
         return "Steam"
 
     try:
-        out = _run_libnom(["Analyze", "-I", save_hg])
+        out = _run_libnom(["Analyze", "-I", candidate])
         u = out.upper()
         if "MICROSOFT" in u:
             return "Microsoft"
@@ -293,29 +400,34 @@ def detect_platform_format_from_savehg(save_folder: str) -> str:
     return "Steam"
 
 
-def convert_json_to_savehg(platform_format: str,json_in_path: str,save_folder: str,work_dir: str,out_name: str) -> None:
+def convert_json_to_savehg(platform_format: str, json_in_path: str, save_folder: str, work_dir: str, out_name: str) -> None:
     r"""
-    Convert JSON -> platform output in work_dir, replace <save_folder>\<out_name>
-    with the produced .data, then delete ALL .data/.meta from work_dir.
+    Convert JSON -> platform output in work_dir.
+    Writes BOTH:
+      - <save_folder>\<out_name>            from newest .data
+      - <save_folder>\<mf_out_name>         from newest .meta
+    Then deletes ALL .data/.meta from work_dir.
     """
     if not os.path.isfile(json_in_path):
         raise FileNotFoundError(f"JSON input not found: {json_in_path}")
 
     save_hg = os.path.join(save_folder, out_name)
-    tmp_target = save_hg + ".tmp"
-    
-    # Ensure a clean workdir for this conversion
+    mf_name = mf_name_for_save(out_name)
+    mf_save_hg = os.path.join(save_folder, mf_name)
+
+    tmp_target_data = save_hg + ".tmp"
+    tmp_target_meta = mf_save_hg + ".tmp"
+
+    # Clean workdir of previous outputs
     for name in list(os.listdir(work_dir)):
         if name.lower().endswith((".data", ".meta")):
             try:
                 os.remove(os.path.join(work_dir, name))
             except Exception:
                 pass
-    
-    # Snapshot before conversion so we can identify *new* outputs
+
     before = set(os.listdir(work_dir))
 
-    # Convert JSON back to platform output (goes to work_dir)
     _run_libnom([
         "Convert",
         "-I", json_in_path,
@@ -326,7 +438,6 @@ def convert_json_to_savehg(platform_format: str,json_in_path: str,save_folder: s
     after = set(os.listdir(work_dir))
     created = list(after - before)
 
-    # Find newest .data created
     data_candidates = [f for f in created if f.lower().endswith(".data")]
     meta_candidates = [f for f in created if f.lower().endswith(".meta")]
 
@@ -337,18 +448,24 @@ def convert_json_to_savehg(platform_format: str,json_in_path: str,save_folder: s
 
     if not data_candidates:
         raise RuntimeError("Convert succeeded but no .data output was found in the work folder.")
+    if not meta_candidates:
+        raise RuntimeError("Convert succeeded but no .meta output was found in the work folder.")
 
-    data_candidates.sort(
-        key=lambda f: os.path.getmtime(os.path.join(work_dir, f)),
-        reverse=True
-    )
+    data_candidates.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
+    meta_candidates.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
+
     data_path = os.path.join(work_dir, data_candidates[0])
+    meta_path = os.path.join(work_dir, meta_candidates[0])
 
-    # Atomic replace
-    shutil.copy2(data_path, tmp_target)
-    os.replace(tmp_target, save_hg)
+    # Atomic replace (data)
+    shutil.copy2(data_path, tmp_target_data)
+    os.replace(tmp_target_data, save_hg)
 
-    # FULL cleanup: no leftovers, ever
+    # Atomic replace (meta -> mf_save*.hg)
+    shutil.copy2(meta_path, tmp_target_meta)
+    os.replace(tmp_target_meta, mf_save_hg)
+
+    # FULL cleanup
     try:
         for name in os.listdir(work_dir):
             if name.lower().endswith((".data", ".meta")):
@@ -380,10 +497,6 @@ def normalize_filename(s: str) -> str:
 
 
 def resource_seed_hex(res: dict) -> str:
-    """
-    Extract "0x..." from a resource dict Seed field.
-    Accept: Seed = [true, "0x...."]
-    """
     if not isinstance(res, dict):
         return ""
     seed = res.get("Seed")
@@ -397,10 +510,6 @@ def resource_seed_hex(res: dict) -> str:
 # -----------------------------
 
 def is_nms_running() -> bool:
-    """
-    Try to detect No Man's Sky running.
-    Best-effort: check process list for common exe names.
-    """
     possible = {"NMS.exe", "NoMansSky.exe", "NoMansSky", "NMS"}
     try:
         startupinfo, creationflags = _windows_no_console_startupinfo()
@@ -685,12 +794,6 @@ def safe_filename(s: str) -> str:
 
 
 def mandatory_backup(save_folder: str, backups_root: str) -> str:
-    r"""
-    Always create a backup of the SAVE FOLDER files into:
-      <backups_root>\<save_id>\backup_YYYYMMDD_HHMMSS\
-
-    Returns backup directory path.
-    """
     save_id = os.path.basename(os.path.abspath(save_folder))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -802,6 +905,11 @@ class ExportTab(ttk.Frame):
         self.json_path = tk.StringVar()
         self.ship_label_var = tk.StringVar()
 
+        # SLOT state
+        self.slot_label_var = tk.StringVar()
+        self._slots: list[dict] = []
+        self._selected_slot: dict | None = None
+
         self.ship_bases = []
         self.ship_labels = []
         self.ship_names_only = []
@@ -810,7 +918,7 @@ class ExportTab(ttk.Frame):
         self.active_seed = ""
         self.platform_format = "Steam"
 
-        # workspace (derived from save folder)
+        # workspace
         self.tool_root = ""
         self.backups_dir = ""
         self.builds_dir = ""
@@ -819,11 +927,9 @@ class ExportTab(ttk.Frame):
         self.import_work_dir = ""
         self.save_id = ""
 
-        # UI
         top = ttk.Frame(self)
         top.pack(fill="x")
 
-        # busy flag
         self._busy = False
 
         ttk.Button(top, text="Choose SAVE Folder (Export)", command=self.choose_folder).pack(side="left")
@@ -835,16 +941,27 @@ class ExportTab(ttk.Frame):
         self.export_btn = ttk.Button(top, text="Export Build", command=self.export_selected, state="disabled")
         self.export_btn.pack(side="left", padx=10)
 
-        # status label (right side of the top row)
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(top, textvariable=self.status_var).pack(side="right")
-
 
         mid = ttk.Frame(self)
         mid.pack(fill="x", pady=(10, 0))
 
-        ttk.Label(mid, text="Corvette:").pack(side="left")
-        self.ship_combo = ttk.Combobox(mid, textvariable=self.ship_label_var, state="readonly", width=95)
+        # Left: Slot
+        left = ttk.Frame(mid)
+        left.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(left, text="Slot:").pack(side="left")
+        self.slot_combo = ttk.Combobox(left, textvariable=self.slot_label_var, state="readonly", width=22)
+        self.slot_combo.pack(side="left", padx=8, fill="x", expand=True)
+        self.slot_combo.bind("<<ComboboxSelected>>", self.on_slot_changed)  # if you have this handler
+
+        # Right: Corvette
+        right = ttk.Frame(mid)
+        right.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
+        ttk.Label(right, text="Corvette:").pack(side="left")
+        self.ship_combo = ttk.Combobox(right, textvariable=self.ship_label_var, state="readonly", width=60)
         self.ship_combo.pack(side="left", padx=8, fill="x", expand=True)
         self.ship_combo.bind("<<ComboboxSelected>>", self.on_ship_selected)
 
@@ -855,8 +972,6 @@ class ExportTab(ttk.Frame):
 
         self.text = ScrolledText(self, wrap="none", height=24)
         self.text.pack(fill="both", expand=True, pady=(10, 0))
-
-        # Dark styling for Tk Text widget
         self.text.configure(
             bg="#151515",
             fg="#e6e6e6",
@@ -870,29 +985,18 @@ class ExportTab(ttk.Frame):
         if status is not None:
             self.status_var.set(status)
 
-        # Disable/enable convert button while working
         self.convert_btn.config(state="disabled" if busy else "normal")
+        self.slot_combo.config(state="disabled" if busy else "readonly")
+        self.ship_combo.config(state="disabled" if busy else "readonly")
 
-        # Export button should stay disabled while busy
         if busy:
             self.export_btn.config(state="disabled")
 
-        # Cursor feedback (watch cursor)
         try:
             self.root_app.configure(cursor="watch" if busy else "")
             self.root_app.update_idletasks()
         except Exception:
             pass
-
-    def choose_folder(self):
-        folder = filedialog.askdirectory(title="Select your NMS SAVE folder to EXPORT from (contains save2.hg)")
-        if folder:
-            self.save_folder.set(folder)
-            d = ensure_tool_dirs_for_save(folder)
-            self._set_workspace_from_dict(d)
-
-            # reset UI state
-            self._clear_loaded_state()
 
     def _set_workspace_from_dict(self, d: dict):
         self.tool_root = d["tool_root"]
@@ -916,6 +1020,54 @@ class ExportTab(ttk.Frame):
         self.export_btn.config(state="disabled")
         self.text.delete("1.0", tk.END)
         self.status_var.set("Ready.")
+        self.ship_combo.set("")
+        self.ship_label_var.set("")
+
+    def _populate_slots(self, folder: str):
+        self._slots = list_save_slots(folder)
+        labels = [slot_display_label(s) for s in self._slots]
+        self.slot_combo["values"] = labels
+        if labels:
+            self.slot_combo.current(0)
+            self._selected_slot = self._slots[0]
+            self.slot_label_var.set(labels[0])
+        else:
+            self._selected_slot = None
+            self.slot_label_var.set("")
+            self.slot_combo["values"] = []
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory(title="Select your NMS SAVE folder to EXPORT from")
+        if folder:
+            self.save_folder.set(folder)
+            d = ensure_tool_dirs_for_save(folder)
+            self._set_workspace_from_dict(d)
+            self._clear_loaded_state()
+            self._populate_slots(folder)
+
+    def on_slot_changed(self, *_):
+        if self._busy:
+            return
+        idx = self.slot_combo.current()
+        self._clear_loaded_state()  # clear ship/json first
+
+        if 0 <= idx < len(self._slots):
+            self._selected_slot = self._slots[idx]
+            self.slot_label_var.set(self.slot_combo["values"][idx])
+        else:
+            self._selected_slot = None
+            self.slot_label_var.set("")
+
+    def _selected_restore_file(self) -> str:
+        # We convert from Restore Point file by default (even number / save2.hg for slot 1)
+        if not self._selected_slot:
+            return "save2.hg"
+        return self._selected_slot["restore_file"]
+
+    def _selected_auto_file(self) -> str:
+        if not self._selected_slot:
+            return "save.hg"
+        return self._selected_slot["auto_file"]
 
     def convert_and_load(self):
         if self._busy:
@@ -926,7 +1078,6 @@ class ExportTab(ttk.Frame):
             messagebox.showerror("Missing folder", "Choose the export save folder first.", parent=self)
             return
 
-        # Fast fail: libNOM must exist before we spawn the worker thread
         if not os.path.isfile(LIBNOM_EXE):
             messagebox.showerror(
                 "libNOM missing",
@@ -936,34 +1087,43 @@ class ExportTab(ttk.Frame):
                 parent=self
             )
             return
-        
+
+        if not self._selected_slot:
+            messagebox.showerror(
+                "No slots found",
+                "No save.hg/save2.hg/save3.hg... files were detected in that folder.",
+                parent=self
+            )
+            return
+
         d = ensure_tool_dirs_for_save(folder)
         self._set_workspace_from_dict(d)
 
         if not pre_convert_warning_gate(self):
             return
 
-        # prevent stale UI while converting
         self.export_btn.config(state="disabled")
         self.ship_combo["values"] = []
         self.text.delete("1.0", tk.END)
 
-        self._set_busy(True, "Converting save to JSON…")
+        slot_num = int(self._selected_slot["slot"])
+        restore_file = self._selected_restore_file()
+
+        self._set_busy(True, f"Converting Slot {slot_num} ({restore_file}) to JSON…")
 
         def worker():
             try:
-                platform_format = detect_platform_format_from_savehg(folder)
-                self.after(0, lambda: self.status_var.set(f"Detected platform: {platform_format} — Converting save to JSON…"))
-                
-                # Phase 1: convert
-                out_json = run_convert_save2hg_to_json(folder, self.export_work_dir, self.save_id)
+                platform_format = detect_platform_format_from_savehg(folder, restore_file)
+                self.after(0, lambda: self.status_var.set(
+                    f"Detected: {platform_format} — Converting Slot {slot_num}…"
+                ))
 
-                # Phase 2: load json
+                out_json = run_convert_savehg_to_json(folder, restore_file, self.export_work_dir, self.save_id, slot_num)
+
                 self.after(0, lambda: self.status_var.set("Loading JSON…"))
                 with open(out_json, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
-                # Phase 3: scan + pair
                 self.after(0, lambda: self.status_var.set("Scanning corvettes…"))
                 ship_bases = find_player_ship_bases(data)
                 if not ship_bases:
@@ -997,7 +1157,6 @@ class ExportTab(ttk.Frame):
                     names_only.append(nm)
                     seeds.append(seed)
 
-                # UI update (must be in main thread)
                 def on_success():
                     self.platform_format = platform_format
                     self.json_path.set(out_json)
@@ -1014,7 +1173,6 @@ class ExportTab(ttk.Frame):
 
                     self.export_btn.config(state="normal")
                     self.on_ship_selected()
-
                     self._set_busy(False, "Ready.")
 
                 self.after(0, on_success)
@@ -1035,7 +1193,6 @@ class ExportTab(ttk.Frame):
                 self.after(0, on_fail2)
 
         threading.Thread(target=worker, daemon=True).start()
-
 
     def on_ship_selected(self, *_):
         idx = self.ship_combo.current()
@@ -1147,10 +1304,14 @@ class ImportTab(ttk.Frame):
         super().__init__(parent, padding=10)
         self.root_app = root_app
 
-        # state (separate from Export tab)
         self.save_folder = tk.StringVar()
         self.json_path = tk.StringVar()
         self.ship_label_var = tk.StringVar()
+
+        # SLOT state
+        self.slot_label_var = tk.StringVar()
+        self._slots: list[dict] = []
+        self._selected_slot: dict | None = None
 
         self.ship_bases = []
         self.ship_labels = []
@@ -1160,7 +1321,6 @@ class ImportTab(ttk.Frame):
         self.active_seed = ""
         self.platform_format = "Steam"
 
-        # workspace (derived from save folder)
         self.tool_root = ""
         self.backups_dir = ""
         self.builds_dir = ""
@@ -1169,12 +1329,11 @@ class ImportTab(ttk.Frame):
         self.import_work_dir = ""
         self.save_id = ""
 
-        # UI
         top = ttk.Frame(self)
         top.pack(fill="x")
 
         self._busy = False
-        
+
         ttk.Button(top, text="Choose TARGET Save Folder (Import)", command=self.choose_folder).pack(side="left")
         ttk.Label(top, textvariable=self.save_folder).pack(side="left", padx=10)
 
@@ -1190,8 +1349,21 @@ class ImportTab(ttk.Frame):
         mid = ttk.Frame(self)
         mid.pack(fill="x", pady=(10, 0))
 
-        ttk.Label(mid, text="Target Corvette:").pack(side="left")
-        self.ship_combo = ttk.Combobox(mid, textvariable=self.ship_label_var, state="readonly", width=95)
+        # Left: Slot
+        left = ttk.Frame(mid)
+        left.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(left, text="Slot:").pack(side="left")
+        self.slot_combo = ttk.Combobox(left, textvariable=self.slot_label_var, state="readonly", width=22)
+        self.slot_combo.pack(side="left", padx=8, fill="x", expand=True)
+        self.slot_combo.bind("<<ComboboxSelected>>", self.on_slot_changed)
+
+        # Right: Corvette
+        right = ttk.Frame(mid)
+        right.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
+        ttk.Label(right, text="Target Corvette:").pack(side="left")
+        self.ship_combo = ttk.Combobox(right, textvariable=self.ship_label_var, state="readonly", width=60)
         self.ship_combo.pack(side="left", padx=8, fill="x", expand=True)
         self.ship_combo.bind("<<ComboboxSelected>>", self.on_ship_selected)
 
@@ -1202,8 +1374,6 @@ class ImportTab(ttk.Frame):
 
         self.text = ScrolledText(self, wrap="none", height=24)
         self.text.pack(fill="both", expand=True, pady=(10, 0))
-
-        # Dark styling for Tk Text widget
         self.text.configure(
             bg="#151515",
             fg="#e6e6e6",
@@ -1218,8 +1388,9 @@ class ImportTab(ttk.Frame):
             self.status_var.set(status)
 
         self.convert_btn.config(state="disabled" if busy else "normal")
+        self.slot_combo.config(state="disabled" if busy else "readonly")
+        self.ship_combo.config(state="disabled" if busy else "readonly")
 
-        # Import button must stay disabled while busy
         if busy:
             self.import_btn.config(state="disabled")
 
@@ -1231,15 +1402,6 @@ class ImportTab(ttk.Frame):
 
         if not busy and isinstance(self.last_loaded_root, dict) and self.ship_bases:
             self.import_btn.config(state="normal")
-
-
-    def choose_folder(self):
-        folder = filedialog.askdirectory(title="Select your TARGET NMS save folder to IMPORT into (contains save2.hg)")
-        if folder:
-            self.save_folder.set(folder)
-            d = ensure_tool_dirs_for_save(folder)
-            self._set_workspace_from_dict(d)
-            self._clear_loaded_state()
 
     def _set_workspace_from_dict(self, d: dict):
         self.tool_root = d["tool_root"]
@@ -1263,6 +1425,53 @@ class ImportTab(ttk.Frame):
         self.import_btn.config(state="disabled")
         self.text.delete("1.0", tk.END)
         self.status_var.set("Ready.")
+        self.ship_combo.set("")
+        self.ship_label_var.set("")
+
+    def _populate_slots(self, folder: str):
+        self._slots = list_save_slots(folder)
+        labels = [slot_display_label(s) for s in self._slots]
+        self.slot_combo["values"] = labels
+        if labels:
+            self.slot_combo.current(0)
+            self._selected_slot = self._slots[0]
+            self.slot_label_var.set(labels[0])
+        else:
+            self._selected_slot = None
+            self.slot_label_var.set("")
+            self.slot_combo["values"] = []
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory(title="Select your TARGET NMS save folder to IMPORT into")
+        if folder:
+            self.save_folder.set(folder)
+            d = ensure_tool_dirs_for_save(folder)
+            self._set_workspace_from_dict(d)
+            self._clear_loaded_state()
+            self._populate_slots(folder)
+
+    def on_slot_changed(self, *_):
+        if self._busy:
+            return
+        idx = self.slot_combo.current()
+        self._clear_loaded_state()  # clear ship/json first
+
+        if 0 <= idx < len(self._slots):
+            self._selected_slot = self._slots[idx]
+            self.slot_label_var.set(self.slot_combo["values"][idx])
+        else:
+            self._selected_slot = None
+            self.slot_label_var.set("")
+
+    def _selected_restore_file(self) -> str:
+        if not self._selected_slot:
+            return "save2.hg"
+        return self._selected_slot["restore_file"]
+
+    def _selected_auto_file(self) -> str:
+        if not self._selected_slot:
+            return "save.hg"
+        return self._selected_slot["auto_file"]
 
     def convert_and_load(self):
         if self._busy:
@@ -1273,7 +1482,6 @@ class ImportTab(ttk.Frame):
             messagebox.showerror("Missing folder", "Choose the target save folder first.", parent=self)
             return
 
-        # Fast fail: libNOM must exist before we spawn the worker thread
         if not os.path.isfile(LIBNOM_EXE):
             messagebox.showerror(
                 "libNOM missing",
@@ -1284,33 +1492,42 @@ class ImportTab(ttk.Frame):
             )
             return
 
+        if not self._selected_slot:
+            messagebox.showerror(
+                "No slots found",
+                "No save.hg/save2.hg/save3.hg... files were detected in that folder.",
+                parent=self
+            )
+            return
+
         d = ensure_tool_dirs_for_save(folder)
         self._set_workspace_from_dict(d)
 
         if not pre_convert_warning_gate(self):
             return
 
-        # prevent stale UI while converting
         self.import_btn.config(state="disabled")
         self.ship_combo["values"] = []
         self.text.delete("1.0", tk.END)
 
-        self._set_busy(True, "Converting save to JSON…")
+        slot_num = int(self._selected_slot["slot"])
+        restore_file = self._selected_restore_file()
+
+        self._set_busy(True, f"Converting Slot {slot_num} ({restore_file}) to JSON…")
 
         def worker():
             try:
-                platform_format = detect_platform_format_from_savehg(folder)
-                self.after(0, lambda: self.status_var.set(f"Detected platform: {platform_format} — Converting save to JSON…"))
+                platform_format = detect_platform_format_from_savehg(folder, restore_file)
+                self.after(0, lambda: self.status_var.set(
+                    f"Detected: {platform_format} — Converting Slot {slot_num}…"
+                ))
 
-                # Phase 1: convert
-                out_json = run_convert_save2hg_to_json(folder, self.import_work_dir, self.save_id)
+                out_json = run_convert_savehg_to_json(folder, restore_file, self.import_work_dir, self.save_id, slot_num)
 
-                # Phase 2: load json
                 self.after(0, lambda: self.status_var.set("Loading JSON…"))
                 with open(out_json, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
-                # Phase 3: scan + pair
                 self.after(0, lambda: self.status_var.set("Scanning corvettes…"))
                 ship_bases = find_player_ship_bases(data)
                 if not ship_bases:
@@ -1344,7 +1561,6 @@ class ImportTab(ttk.Frame):
                     names_only.append(nm)
                     seeds.append(seed)
 
-                # UI update (must be in main thread)
                 def on_success():
                     self.platform_format = platform_format
                     self.json_path.set(out_json)
@@ -1361,7 +1577,6 @@ class ImportTab(ttk.Frame):
 
                     self.import_btn.config(state="normal")
                     self.on_ship_selected()
-
                     self._set_busy(False, "Ready.")
 
                 self.after(0, on_success)
@@ -1454,7 +1669,11 @@ class ImportTab(ttk.Frame):
                 parent=self
             )
             return
-        
+
+        if not self._selected_slot:
+            messagebox.showerror("No slot", "Pick a Slot first.", parent=self)
+            return
+
         if not isinstance(self.last_loaded_root, dict):
             messagebox.showerror("Not loaded", "Convert + Load in the Import tab first.", parent=self)
             return
@@ -1499,8 +1718,15 @@ class ImportTab(ttk.Frame):
         meta_name = meta.get("name") if isinstance(meta, dict) else None
         meta_author = meta.get("author") if isinstance(meta, dict) else None
 
+        slot_num = int(self._selected_slot["slot"])
+        auto_file = self._selected_auto_file()
+        restore_file = self._selected_restore_file()
+
         summary_lines = [
             "This will REPLACE the entire build on the selected Corvette.",
+            "",
+            f"Target Slot: {slot_num}",
+            f"Will write: {auto_file} + {restore_file} (and mf_*.hg pairs)",
             "",
             f"Target Corvette: {target_name}",
             f"Imported objects: {len(imported_objects)}",
@@ -1530,31 +1756,26 @@ class ImportTab(ttk.Frame):
             messagebox.showerror("Import failed", "Could not locate Objects[] in the selected Corvette base.", parent=self)
             return
 
-        # Apply build in memory (fast)
         self.status_var.set("Applying build…")
         parent[key] = imported_objects
 
-        # From this point, do the heavy writing/conversion in a background thread
         self._set_busy(True, "Writing save…")
 
-        # Copy the data we need into locals so the worker doesn't depend on UI state changing
         root_to_write = self.last_loaded_root
         work_dir = self.import_work_dir
-        platform_format = self.platform_format or detect_platform_format_from_savehg(folder)
+        platform_format = self.platform_format or detect_platform_format_from_savehg(folder, restore_file)
         save_folder = folder
 
         def worker_write():
             tmp_json = os.path.join(work_dir, "_corvette_tool_modified_save.json")
             try:
-                # Write modified JSON
                 with open(tmp_json, "w", encoding="utf-8") as f:
                     json.dump(root_to_write, f, ensure_ascii=False)
 
-                # Convert + write both saves
-                convert_json_to_savehg(platform_format, tmp_json, save_folder, work_dir, "save2.hg")
-                convert_json_to_savehg(platform_format, tmp_json, save_folder, work_dir, "save.hg")
+                # Write BOTH files of the selected slot + their mf_ counterparts
+                convert_json_to_savehg(platform_format, tmp_json, save_folder, work_dir, restore_file)
+                convert_json_to_savehg(platform_format, tmp_json, save_folder, work_dir, auto_file)
 
-                # Cleanup temp json
                 try:
                     os.remove(tmp_json)
                 except Exception:
@@ -1577,7 +1798,6 @@ class ImportTab(ttk.Frame):
 
             except subprocess.CalledProcessError as e:
                 def on_fail_proc():
-                    # Show libNOM's real error text (stdout/stderr)
                     stdout = (getattr(e, "stdout", "") or "").strip()
                     stderr = (getattr(e, "stderr", "") or "").strip()
                     details = "\n\n".join([t for t in (stdout, stderr) if t]) or str(e)
@@ -1606,7 +1826,6 @@ class ImportTab(ttk.Frame):
                 self.after(0, on_fail)
 
         threading.Thread(target=worker_write, daemon=True).start()
-
 
 
 if __name__ == "__main__":
