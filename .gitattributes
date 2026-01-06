@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Ignore bundled Python runtime (includes Tcl/Tk)
+python/** linguist-vendored
+
+# Ignore bundled third-party tools
+libNOM/** linguist-vendored
