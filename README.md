@@ -73,19 +73,24 @@ HOW IT WORKS
 ------------
 
 EXPORT:
-- Select a No Man’s Sky save folder containing save2.hg
-- The tool converts the save to JSON using libNOM
+- Select a No Man’s Sky save folder
+- Select a Save Slot (Slot 1, Slot 2, etc.)
+- The tool converts the selected slot’s save to JSON using libNOM
 - Select a Corvette from the list (must NOT be your active ship)
 - Export its Objects[] into a build JSON file
 
 IMPORT:
-- Select a target save folder
+- Select a target No Man’s Sky save folder
+- Select a Save Slot to import into
+- Convert + load the Corvettes from that slot
 - Select a target Corvette (must NOT be your active ship)
 - Choose a previously exported build JSON
-- The tool replaces the Corvette’s Objects[] and writes back the save
-- A full backup of the save folder is created automatically
+- The tool replaces the Corvette’s Objects[] and writes the save back
 
-Both save2.hg and save.hg are updated for safety and compatibility.
+Safety & compatibility:
+- Both files belonging to the selected slot are updated (Autosave + Restore Point)
+- Matching metadata files (mf_save*.hg) are written as well
+- A full backup of the save folder is created automatically before import
 
 
 ----------------------
