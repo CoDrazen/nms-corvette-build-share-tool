@@ -102,6 +102,8 @@ IMPORTANT SAFETY NOTES
 - ALWAYS close No Man’s Sky before exporting or importing
 - DO NOT import into your currently active Corvette
 - Use a dummy or disposable Corvette when testing
+  - ENSURE you have unlocked the required Corvette parts in-game; otherwise, sections of the imported build may appear invisible or glitched
+  - For best results, use Creative Mode or verify part ownership at a Corvette Workshop before importing complex designs
 - Create a simple Corvette to be replaced before importing a build
 - Backups are created automatically, but caution is still advised
 - This tool modifies save files. Use at your own risk.
