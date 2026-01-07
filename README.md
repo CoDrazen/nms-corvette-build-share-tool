@@ -98,8 +98,11 @@ IMPORTANT SAFETY NOTES
 ----------------------
 
 ALWAYS close No Man’s Sky before exporting or importing
+
 DO NOT import into your currently active Corvette
+
 Use a dummy or disposable Corvette when testing
+
 Create a simple Corvette to be replaced before importing a build
 
 Backups are created automatically, but caution is still advised
