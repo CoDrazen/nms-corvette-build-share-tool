@@ -8,14 +8,15 @@ It has been tested on:
 - Windows 11
 - Steam version of No Man’s Sky
 
-Feedback from users on other platforms is especially valuable:
+Feedback from users with other save formats is especially valuable
+(the app runs on Windows, but save formats may differ):
 - GOG
 - Microsoft Store
 - PlayStation save imports
 - Switch save imports
 
 If you test this tool, please report:
-- Your platform (Steam / GOG / Microsoft / PS / Switch)
+- Your save format (Steam / GOG / Microsoft / PS / Switch)
 - Whether export worked
 - Whether import worked
 - Any errors or warnings shown
@@ -31,13 +32,14 @@ Even a simple “works fine on my setup” is helpful.
 NMS Corvette Build Share Tool
 -----------------------------
 
-A portable desktop tool for exporting and importing Corvette base builds in No Man’s Sky.
+A portable desktop tool for exporting and importing Corvette base builds
+in No Man’s Sky.
 
 This application allows you to:
 
-- Export a Corvette’s base objects into a shareable JSON build file
-- Import a build into another Corvette (full replace)
-- Automatically back up save files before any modification
+- Export a Corvette’s Objects[] into a shareable build JSON (wrapper format)
+- Import a build into another Corvette (full replace of Objects[])
+- Automatically back up the entire save folder before any import write
 - Run fully portable (no system-wide Python install required)
 
 
@@ -46,9 +48,8 @@ REQUIREMENTS
 ------------
 
 - Windows 10 / 11
-- A valid save folder containing save*.hg files
+- A valid No Man’s Sky save folder containing save*.hg files
 - .NET Desktop Runtime (x64)
-
 
 IMPORTANT:
 
@@ -70,6 +71,18 @@ Option B (debug / see logs):
 - Double-click run_debug.bat
 
 
+---------
+SLOT MAP
+---------
+
+No Man’s Sky stores each slot as a pair (Autosave + Restore Point):
+
+Slot 1: save.hg  + save2.hg
+Slot 2: save3.hg + save4.hg
+Slot 3: save5.hg + save6.hg
+...
+
+
 ------------
 HOW IT WORKS
 ------------
@@ -77,7 +90,9 @@ HOW IT WORKS
 EXPORT:
 - Select a No Man’s Sky save folder
 - Select a Save Slot (Slot 1, Slot 2, etc.)
-- The tool converts the selected slot’s save to JSON using libNOM
+- The tool converts the selected slot to JSON using libNOM
+  (by default it converts the slot’s Restore Point file:
+   save2.hg, save4.hg, save6.hg…)
 - Select a Corvette from the list (must NOT be your active ship)
 - Export its Objects[] into a build JSON file
 
@@ -87,12 +102,45 @@ IMPORT:
 - Convert + load the Corvettes from that slot
 - Select a target Corvette (must NOT be your active ship)
 - Choose a previously exported build JSON
-- The tool replaces the Corvette’s Objects[] and writes the save back
+- The tool replaces the Corvette’s Objects[] and writes both slot files back
 
 Safety & compatibility:
-- Both files belonging to the selected slot are updated (Autosave + Restore Point)
+- Both files belonging to the selected slot are updated
+  (Autosave + Restore Point)
 - Matching metadata files (mf_save*.hg) are written as well
 - A full backup of the save folder is created automatically before import
+
+
+-----------------
+BUILD FILE FORMAT
+-----------------
+
+Exported builds are saved as a wrapper JSON object containing metadata plus
+the objects list:
+
+- format:  NMS-CorvetteBuild
+- version: 1
+- name:    (your build name)
+- author:  (optional)
+- created_utc: timestamp
+- objects: the Corvette Objects[] list
+
+Import accepts:
+- Wrapper builds with "objects": [...]
+- A raw JSON list representing Objects[] directly
+- Wrapper builds with "Objects": [...] (legacy/alternate format)
+
+
+-------------
+WORKSPACE FILES
+-------------
+
+The tool creates a workspace folder next to your save folder:
+
+NMS_CorvetteTool/
+  Backups/   (created automatically before import)
+  Builds/    (default location for exported build files)
+  Work/      (temporary conversion files)
 
 
 ----------------------
@@ -100,10 +148,12 @@ IMPORTANT SAFETY NOTES
 ----------------------
 
 - ALWAYS close No Man’s Sky before exporting or importing
-- DO NOT import into your currently active Corvette
+- DO NOT export/import into your currently active Corvette
 - Use a dummy or disposable Corvette when testing
-  - ENSURE you have unlocked the required Corvette parts in-game; otherwise, sections of the imported build may appear invisible or glitched
-  - For best results, use Creative Mode or verify part ownership at a Corvette Workshop before importing complex designs
+  - ENSURE you have unlocked the required Corvette parts in-game;
+    otherwise, sections of the imported build may appear invisible or glitched
+  - For best results, use Creative Mode or verify part ownership at a
+    Corvette Workshop before importing complex designs
 - Create a simple Corvette to be replaced before importing a build
 - Backups are created automatically, but caution is still advised
 - This tool modifies save files. Use at your own risk.
