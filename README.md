@@ -142,11 +142,9 @@ The tool creates a workspace folder next to your save folder:
 
 NMS_CorvetteTool/
 
-  Backups/   (created automatically before import)
-
-  Builds/    (default location for exported build files)
-
-  Work/      (temporary conversion files)
+- Backups/   (created automatically before import)
+- Builds/    (default location for exported build files)
+- Work/      (temporary conversion files)
 
 
 ----------------------
