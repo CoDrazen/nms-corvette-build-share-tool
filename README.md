@@ -46,7 +46,7 @@ REQUIREMENTS
 ------------
 
 - Windows 10 / 11
-- A valid save folder containing save2.hg
+- A valid save folder containing save*.hg files
 - .NET Desktop Runtime (x64)
 
 IMPORTANT:
@@ -99,7 +99,8 @@ IMPORTANT SAFETY NOTES
 
 ALWAYS close No Man’s Sky before exporting or importing
 DO NOT import into your currently active Corvette
-Use an empty or disposable Corvette when testing
+Use a dummy or disposable Corvette when testing
+Create a simple Corvette to be replaced before importing a build
 
 Backups are created automatically, but caution is still advised
 
