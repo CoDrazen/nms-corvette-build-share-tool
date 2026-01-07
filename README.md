@@ -49,7 +49,9 @@ REQUIREMENTS
 - A valid save folder containing save*.hg files
 - .NET Desktop Runtime (x64)
 
+
 IMPORTANT:
+
 If .NET is not installed, Windows may prompt you to install it
 automatically when the tool runs (similar to libNOM / NomNom behavior).
 
