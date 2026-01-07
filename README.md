@@ -78,8 +78,11 @@ SLOT MAP
 No Man’s Sky stores each slot as a pair (Autosave + Restore Point):
 
 Slot 1: save.hg  + save2.hg
+
 Slot 2: save3.hg + save4.hg
+
 Slot 3: save5.hg + save6.hg
+
 ...
 
 
@@ -167,7 +170,7 @@ This tool was inspired by the original Corvette export/import research by:
 
 Weenzo (T-rash_raccoon)
 "I managed to export and import a Corvette build"
-https://www.reddit.com/r/NoMansSkyTheGame/comments/1npis7l/i_managed_to_export_and_import_a_corvette_build/
+https://www.reddit.com/r/NoMansSkyTheGame/comments/1npis7l
 
 Special thanks to Weenzo for documenting the method that made this tool possible.
 
