@@ -107,6 +107,8 @@ IMPORT:
 - Choose a previously exported build JSON
 - The tool replaces the Corvette’s Objects[] and writes both slot files back
 
+   - Note: This tool imports build parts/placement/colors (the Corvette base Objects[]) only — it does not change ship class, stats, inventory, upgrades, or ownership.
+
 Safety & compatibility:
 - Both files belonging to the selected slot are updated
   (Autosave + Restore Point)
