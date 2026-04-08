@@ -1,30 +1,299 @@
 import os
+import argparse
 import re
 import json
 import shutil
 import subprocess
+import sys
+import ctypes
+import ctypes.wintypes
 import tkinter as tk
 import threading
+import traceback
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
 from datetime import datetime, timezone
 
 
-# Portable app path
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# Portable app paths
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    RUNTIME_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    RUNTIME_DIR = APP_DIR
+
+# App metadata + settings path
+APP_NAME = "NMS Corvette Build Share Tool"
+APP_VENDOR = "CoDrazen"
+APP_VERSION = "1.0.0"
+
+
+def default_settings_dir() -> str:
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return os.path.join(local_app_data, APP_VENDOR, APP_NAME)
+    return APP_DIR
+
+
+SETTINGS_DIR = default_settings_dir()
+SETTINGS_PATH = os.path.join(SETTINGS_DIR, "nms_corvette_tool_settings.json")
 
 # Portable bundled EXE path
-LIBNOM_EXE = os.path.join(APP_DIR, "libNOM", "libNOM.io.cli.exe")
+LIBNOM_EXE = os.path.join(RUNTIME_DIR, "libNOM", "libNOM.io.cli.exe")
+APP_ICON_ICO = os.path.join(RUNTIME_DIR, "icons", "nms-app-icon-galaxy-nobg-256.ico")
 
-# Set True to print pairing diagnostics to the terminal
-DEBUG_PAIRING = True
+# Set via run_debug.bat to print pairing diagnostics to the terminal
+DEBUG_PAIRING = os.environ.get("NMS_CORVETTE_DEBUG_PAIRING", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Wrapper file format constants
 BUILD_FORMAT = "NMS-CorvetteBuild"
 BUILD_VERSION = 1
+SUPPORTED_BUILD_VERSIONS = {BUILD_VERSION}
 
 # Tool workspace folder (created next to st_... save folder)
 TOOL_ROOT_NAME = "NMS_CorvetteTool"
+MAX_TRACKED_WORK_ROOTS = 12
+
+PLATFORM_LABELS = [
+    "Auto-detect",
+    "Steam",
+    "GOG",
+    "Microsoft",
+    "PlayStation",
+    "Switch",
+]
+
+PLATFORM_LABEL_TO_VALUE = {
+    "Steam": "Steam",
+    "GOG": "Gog",
+    "Microsoft": "Microsoft",
+    "PlayStation": "Playstation",
+    "Switch": "Switch",
+}
+
+
+def default_workspace_root_for_save(save_folder: str) -> str:
+    save_folder = os.path.abspath(save_folder)
+    parent = os.path.dirname(save_folder)
+    return os.path.join(parent, TOOL_ROOT_NAME)
+
+
+def sanitize_app_settings(settings) -> dict:
+    if not isinstance(settings, dict):
+        return {}
+
+    cleaned = {}
+
+    workspace_root = settings.get("workspace_root", "")
+    if isinstance(workspace_root, str) and workspace_root.strip():
+        cleaned["workspace_root"] = os.path.abspath(workspace_root.strip())
+
+    recent_work_roots = normalize_recent_work_roots(settings.get("recent_work_roots", []))
+    if recent_work_roots:
+        cleaned["recent_work_roots"] = recent_work_roots
+
+    return cleaned
+
+
+def load_app_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return sanitize_app_settings(data)
+    except Exception:
+        pass
+    return {}
+
+
+def save_app_settings(settings: dict) -> bool:
+    try:
+        payload = sanitize_app_settings(settings)
+
+        if not payload:
+            if os.path.isfile(SETTINGS_PATH):
+                os.remove(SETTINGS_PATH)
+            try:
+                if os.path.isdir(SETTINGS_DIR) and not os.listdir(SETTINGS_DIR):
+                    os.rmdir(SETTINGS_DIR)
+            except Exception:
+                pass
+            return True
+
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def short_display_path(path: str, tail_parts: int = 3, max_chars: int = 74) -> str:
+    if not isinstance(path, str) or not path.strip():
+        return ""
+
+    full = os.path.abspath(path)
+    if len(full) <= max_chars:
+        return full
+
+    parts = full.split(os.sep)
+    if len(parts) <= tail_parts + 1:
+        return full
+
+    drive = parts[0]
+    tail = os.sep.join(parts[-tail_parts:])
+    if drive.endswith(":"):
+        return f"{drive}{os.sep}...{os.sep}{tail}"
+    return f"...{os.sep}{tail}"
+
+
+def normalize_recent_work_roots(value) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    out = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        path = os.path.abspath(item.strip())
+        if os.path.basename(path).lower() != "work":
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+        if len(out) >= MAX_TRACKED_WORK_ROOTS:
+            break
+    return out
+
+
+def resolve_platform_format(save_folder: str, preferred_save_file: str, selected_label: str) -> str:
+    label = (selected_label or "Auto-detect").strip()
+    if label and label != "Auto-detect":
+        platform_value = PLATFORM_LABEL_TO_VALUE.get(label)
+        if platform_value:
+            return platform_value
+        raise ValueError(f"Unsupported manual platform selection: {label}")
+
+    detected = detect_platform_format_from_savehg(save_folder, preferred_save_file)
+    if detected:
+        return detected
+
+    raise RuntimeError(
+        "Could not detect the save platform automatically.\n\n"
+        "Choose the platform manually from the Platform dropdown and try again."
+    )
+
+
+def apply_app_icon(root: tk.Tk):
+    try:
+        if os.path.isfile(APP_ICON_ICO):
+            root.iconbitmap(APP_ICON_ICO)
+    except Exception:
+        pass
+    return None
+
+
+def windows_apps_use_dark_mode() -> bool:
+    if os.name != "nt":
+        return False
+
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return int(value) == 0
+    except Exception:
+        # Default to dark because the app itself uses a dark theme.
+        return True
+
+
+def apply_windows_title_bar_theme(root: tk.Tk) -> bool:
+    if os.name != "nt":
+        return False
+
+    try:
+        root.update_idletasks()
+        user32 = ctypes.windll.user32
+        dwmapi = ctypes.windll.dwmapi
+
+        GA_ROOT = 2
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
+        DWMWA_BORDER_COLOR = 34
+        DWMWA_CAPTION_COLOR = 35
+        DWMWA_TEXT_COLOR = 36
+
+        hwnd = user32.GetAncestor(root.winfo_id(), GA_ROOT)
+        if not hwnd:
+            hwnd = user32.GetParent(root.winfo_id()) or root.winfo_id()
+        if not hwnd:
+            return False
+
+        use_dark = windows_apps_use_dark_mode()
+        dark_mode_value = ctypes.c_int(1 if use_dark else 0)
+
+        applied = False
+        for attr in (DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD):
+            result = dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_uint(attr),
+                ctypes.byref(dark_mode_value),
+                ctypes.sizeof(dark_mode_value)
+            )
+            if result == 0:
+                applied = True
+
+        if use_dark:
+            # COLORREF uses 0x00bbggrr.
+            caption_color = ctypes.c_uint(0x001E1E1E)
+            text_color = ctypes.c_uint(0x00E6E6E6)
+            border_color = ctypes.c_uint(0x00333333)
+
+            for attr, value in (
+                (DWMWA_CAPTION_COLOR, caption_color),
+                (DWMWA_TEXT_COLOR, text_color),
+                (DWMWA_BORDER_COLOR, border_color),
+            ):
+                result = dwmapi.DwmSetWindowAttribute(
+                    ctypes.c_void_p(hwnd),
+                    ctypes.c_uint(attr),
+                    ctypes.byref(value),
+                    ctypes.sizeof(value)
+                )
+                if result == 0:
+                    applied = True
+
+        user32.SetWindowPos(
+            ctypes.c_void_p(hwnd),
+            ctypes.c_void_p(0),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        )
+        return applied
+    except Exception:
+        pass
+
+    return False
 
 
 def apply_dark_theme(root: tk.Tk):
@@ -44,6 +313,8 @@ def apply_dark_theme(root: tk.Tk):
     style.configure(".", background="#1e1e1e", foreground="#e6e6e6")
     style.configure("TFrame", background="#1e1e1e")
     style.configure("TLabel", background="#1e1e1e", foreground="#e6e6e6")
+    style.configure("Hint.TLabel", background="#1e1e1e", foreground="#a7a7a7")
+    style.configure("Path.TLabel", background="#1e1e1e", foreground="#cfd7e6")
 
     style.configure(
         "TButton",
@@ -55,6 +326,18 @@ def apply_dark_theme(root: tk.Tk):
         "TButton",
         background=[("active", "#3a3a3a"), ("disabled", "#2a2a2a")],
         foreground=[("disabled", "#777777")]
+    )
+
+    style.configure(
+        "Accent.TButton",
+        background="#365f42",
+        foreground="#f2fff4",
+        padding=(12, 6)
+    )
+    style.map(
+        "Accent.TButton",
+        background=[("active", "#42744f"), ("disabled", "#2f3a32")],
+        foreground=[("disabled", "#93a193")]
     )
 
     style.configure(
@@ -75,6 +358,9 @@ def apply_dark_theme(root: tk.Tk):
     style.map("TNotebook.Tab", background=[("selected", "#3a3a3a")])
 
     style.configure("TSeparator", background="#333333")
+    style.configure("TLabelframe", background="#1e1e1e", foreground="#e6e6e6")
+    style.configure("TLabelframe.Label", background="#1e1e1e", foreground="#e6e6e6")
+    style.configure("TCheckbutton", background="#1e1e1e", foreground="#e6e6e6")
 
 
 # -----------------------------
@@ -192,7 +478,7 @@ def mf_name_for_save(save_name: str) -> str:
 # Tool workspace helpers
 # -----------------------------
 
-def ensure_tool_dirs_for_save(save_folder: str) -> dict:
+def ensure_tool_dirs_for_save(save_folder: str, workspace_root_override: str = "") -> dict:
     r"""
     Creates (if missing) a tool workspace next to the save folder:
 
@@ -209,10 +495,13 @@ def ensure_tool_dirs_for_save(save_folder: str) -> dict:
       save_id
     """
     save_folder = os.path.abspath(save_folder)
-    parent = os.path.dirname(save_folder)
     save_id = os.path.basename(save_folder)
 
-    tool_root = os.path.join(parent, TOOL_ROOT_NAME)
+    if isinstance(workspace_root_override, str) and workspace_root_override.strip():
+        tool_root = os.path.abspath(workspace_root_override.strip())
+    else:
+        tool_root = default_workspace_root_for_save(save_folder)
+
     backups_dir = os.path.join(tool_root, "Backups")
     builds_dir = os.path.join(tool_root, "Builds")
     work_root = os.path.join(tool_root, "Work")
@@ -241,29 +530,60 @@ def stable_work_json_path(work_dir: str, save_id: str, slot_num: int) -> str:
     return os.path.join(work_dir, f"{save_id}.slot{slot_num}.save.json")
 
 
-def clean_work_json(work_dir: str, save_id: str, slot_num: int) -> None:
+def is_transient_work_artifact(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
+    return name.lower().endswith((".json", ".data", ".meta"))
+
+
+def clean_transient_work_dir(work_dir: str) -> None:
     """
-    Clean ONLY inside this slot-specific work_dir:
-      - delete stable JSON for this slot
-      - delete any leftover save*.hg.*.json produced by libNOM
+    Remove app-generated transient files from one slot-specific Work directory.
+    Builds are stored elsewhere, so JSON/data/meta files here are safe to clear.
     """
-    stable = stable_work_json_path(work_dir, save_id, slot_num)
-    try:
-        if os.path.isfile(stable):
-            os.remove(stable)
-    except Exception:
-        pass
+    if not isinstance(work_dir, str) or not work_dir.strip() or not os.path.isdir(work_dir):
+        return
 
     try:
         for name in os.listdir(work_dir):
-            low = name.lower()
-            if low.startswith("save") and low.endswith(".json") and ".hg." in low:
+            if not is_transient_work_artifact(name):
+                continue
+            try:
+                os.remove(os.path.join(work_dir, name))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def clean_transient_work_root(work_root: str) -> None:
+    """
+    Remove transient files from an internal Work root, including Export/Import
+    subfolders for any save IDs touched in this session.
+    """
+    if not isinstance(work_root, str) or not work_root.strip() or not os.path.isdir(work_root):
+        return
+
+    try:
+        for root, _, files in os.walk(work_root):
+            for name in files:
+                if not is_transient_work_artifact(name):
+                    continue
                 try:
-                    os.remove(os.path.join(work_dir, name))
+                    os.remove(os.path.join(root, name))
                 except Exception:
                     pass
     except Exception:
         pass
+
+
+def clean_work_json(work_dir: str, save_id: str, slot_num: int) -> None:
+    """
+    Clean ONLY inside this slot-specific work_dir:
+      - delete stable JSON produced for viewing in the app
+      - delete any leftover libNOM JSON/data/meta outputs
+    """
+    clean_transient_work_dir(work_dir)
 
 
 # -----------------------------
@@ -379,7 +699,7 @@ def detect_platform_format_from_savehg(save_folder: str, preferred_save_file: st
                 break
 
     if not os.path.isfile(candidate):
-        return "Steam"
+        return ""
 
     try:
         out = _run_libnom(["Analyze", "-I", candidate])
@@ -397,7 +717,7 @@ def detect_platform_format_from_savehg(save_folder: str, preferred_save_file: st
     except Exception:
         pass
 
-    return "Steam"
+    return ""
 
 
 def convert_json_to_savehg(platform_format: str, json_in_path: str, save_folder: str, work_dir: str, out_name: str) -> None:
@@ -800,13 +1120,30 @@ def mandatory_backup(save_folder: str, backups_root: str) -> str:
     backup_dir = os.path.join(backups_root, save_id, f"backup_{stamp}")
     os.makedirs(backup_dir, exist_ok=True)
 
+    failures = []
+    copied = 0
     for name in os.listdir(save_folder):
         src = os.path.join(save_folder, name)
         if os.path.isfile(src):
             try:
                 shutil.copy2(src, os.path.join(backup_dir, name))
-            except Exception:
-                pass
+                copied += 1
+            except Exception as e:
+                failures.append(f"{name}: {e}")
+
+    if copied == 0:
+        raise RuntimeError(
+            "Backup failed: no save files were copied before import.\n\n"
+            f"Attempted backup folder:\n{backup_dir}"
+        )
+
+    if failures:
+        details = "\n".join(failures[:8])
+        raise RuntimeError(
+            "Backup failed: not every file in the save folder could be copied.\n\n"
+            f"Backup folder:\n{backup_dir}\n\n"
+            f"Details:\n{details}"
+        )
 
     return backup_dir
 
@@ -824,11 +1161,26 @@ def parse_build_file(path: str) -> tuple[list, dict]:
         data = json.load(f)
 
     if isinstance(data, list):
-        return data, {}
+        return data, {"compat_mode": "raw-objects-list"}
 
     if isinstance(data, dict):
         objs = data.get("objects")
         if isinstance(objs, list):
+            if data.get("format") != BUILD_FORMAT:
+                raise ValueError(
+                    f"Unsupported build wrapper format.\n\n"
+                    f"Expected format: {BUILD_FORMAT}\n"
+                    f"Found: {data.get('format')!r}"
+                )
+
+            version = data.get("version")
+            if version not in SUPPORTED_BUILD_VERSIONS:
+                raise ValueError(
+                    "Unsupported build wrapper version.\n\n"
+                    f"Supported version(s): {sorted(SUPPORTED_BUILD_VERSIONS)}\n"
+                    f"Found: {version!r}"
+                )
+
             meta = dict(data)
             meta.pop("objects", None)
             return objs, meta
@@ -837,9 +1189,15 @@ def parse_build_file(path: str) -> tuple[list, dict]:
         if isinstance(objs2, list):
             meta = dict(data)
             meta.pop("Objects", None)
+            meta["compat_mode"] = "Objects-wrapper"
             return objs2, meta
 
-    raise ValueError("Build file must be either a JSON list (Objects[]) or a wrapper object containing 'objects'.")
+    raise ValueError(
+        "Build file must be one of:\n"
+        "- an official wrapper with 'format', 'version', and 'objects'\n"
+        "- a raw JSON list representing Objects[] directly\n"
+        "- a compatibility wrapper containing 'Objects'"
+    )
 
 
 def build_wrapper(objects: list, name: str, author: str) -> dict:
@@ -881,9 +1239,19 @@ def pre_convert_warning_gate(parent_window) -> bool:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.settings = load_app_settings()
+        self.workspace_root_override = str(self.settings.get("workspace_root", "") or "").strip()
+        self._tracked_work_roots = normalize_recent_work_roots(self.settings.get("recent_work_roots", []))
+        self._cleanup_tracked_work_roots()
+
         apply_dark_theme(self)
-        self.title("NMS Corvette Build Share Tool (libNOM)")
+        self._icon_images = apply_app_icon(self)
+        self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("1200x760")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Map>", self._refresh_title_bar_theme, add="+")
+        for delay in (0, 50, 200, 500):
+            self.after(delay, self._refresh_title_bar_theme)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
@@ -894,6 +1262,81 @@ class App(tk.Tk):
         nb.add(self.export_tab, text="Export")
         nb.add(self.import_tab, text="Import")
 
+    def _refresh_title_bar_theme(self, *_):
+        self.after_idle(lambda: apply_windows_title_bar_theme(self))
+
+    def get_workspace_root_override(self) -> str:
+        return self.workspace_root_override
+
+    def set_workspace_root_override(self, path: str) -> bool:
+        cleaned = os.path.abspath(path.strip()) if isinstance(path, str) and path.strip() else ""
+        current = str(self.settings.get("workspace_root", "") or "").strip()
+        if cleaned == current and cleaned == self.workspace_root_override:
+            return True
+
+        self.workspace_root_override = cleaned
+        if cleaned:
+            self.settings["workspace_root"] = cleaned
+        else:
+            self.settings.pop("workspace_root", None)
+        return save_app_settings(self.settings)
+
+    def refresh_workspace_views(self):
+        for tab in (self.export_tab, self.import_tab):
+            if hasattr(tab, "_refresh_workspace_root_display"):
+                tab._refresh_workspace_root_display()
+
+    def _save_tracked_work_roots(self):
+        current = normalize_recent_work_roots(self.settings.get("recent_work_roots", []))
+        desired = list(self._tracked_work_roots[:MAX_TRACKED_WORK_ROOTS])
+        if desired == current:
+            return True
+
+        if desired:
+            self.settings["recent_work_roots"] = desired
+        else:
+            self.settings.pop("recent_work_roots", None)
+        return save_app_settings(self.settings)
+
+    def register_work_root(self, work_root: str):
+        if not isinstance(work_root, str) or not work_root.strip():
+            return
+
+        path = os.path.abspath(work_root.strip())
+        if os.path.basename(path).lower() != "work":
+            return
+
+        existing = [p for p in self._tracked_work_roots if p.lower() != path.lower()]
+        desired = [path] + existing[:MAX_TRACKED_WORK_ROOTS - 1]
+        if desired == list(self._tracked_work_roots):
+            return
+
+        self._tracked_work_roots = desired
+        self._save_tracked_work_roots()
+
+    def _any_operation_busy(self) -> bool:
+        tabs = [getattr(self, "export_tab", None), getattr(self, "import_tab", None)]
+        return any(bool(getattr(tab, "_busy", False)) for tab in tabs if tab is not None)
+
+    def _cleanup_tracked_work_roots(self):
+        for work_root in list(self._tracked_work_roots):
+            clean_transient_work_root(work_root)
+
+    def _on_close(self):
+        if self._any_operation_busy():
+            msg = (
+                "An export or import operation is still running.\n\n"
+                "If you close now, temporary Work files may be left behind.\n\n"
+                "Close anyway?"
+            )
+            if not messagebox.askokcancel("Close app", msg, parent=self):
+                return
+            self.destroy()
+            return
+
+        self._cleanup_tracked_work_roots()
+        self.destroy()
+
 
 class ExportTab(ttk.Frame):
     def __init__(self, parent, root_app: App):
@@ -902,8 +1345,15 @@ class ExportTab(ttk.Frame):
 
         # state
         self.save_folder = tk.StringVar()
+        self.save_folder_display = tk.StringVar(value="No save folder selected.")
         self.json_path = tk.StringVar()
+        self.json_path_display = tk.StringVar(value="No converted JSON loaded.")
         self.ship_label_var = tk.StringVar()
+        self.workspace_root_display = tk.StringVar()
+        self.workspace_mode_var = tk.StringVar()
+        self.details_status_var = tk.StringVar(value="Technical details are hidden.")
+        self.platform_choice = tk.StringVar(value="Auto-detect")
+        self.show_details_var = tk.BooleanVar(value=False)
 
         # SLOT state
         self.slot_label_var = tk.StringVar()
@@ -916,7 +1366,7 @@ class ExportTab(ttk.Frame):
         self.ship_seeds = []
         self.last_loaded_root = None
         self.active_seed = ""
-        self.platform_format = "Steam"
+        self.platform_format = ""
 
         # workspace
         self.tool_root = ""
@@ -932,17 +1382,54 @@ class ExportTab(ttk.Frame):
 
         self._busy = False
 
-        ttk.Button(top, text="Choose SAVE Folder (Export)", command=self.choose_folder).pack(side="left")
-        ttk.Label(top, textvariable=self.save_folder).pack(side="left", padx=10)
+        self.choose_folder_btn = ttk.Button(top, text="Choose SAVE Folder (Export)", command=self.choose_folder)
+        self.choose_folder_btn.pack(side="left")
+        ttk.Label(top, textvariable=self.save_folder_display, style="Path.TLabel").pack(side="left", padx=10, fill="x", expand=True)
 
         self.convert_btn = ttk.Button(top, text="Convert + Load Corvettes", command=self.convert_and_load)
         self.convert_btn.pack(side="left", padx=10)
 
-        self.export_btn = ttk.Button(top, text="Export Build", command=self.export_selected, state="disabled")
+        self.export_btn = ttk.Button(top, text="Export Build", command=self.export_selected, state="disabled", style="Accent.TButton")
         self.export_btn.pack(side="left", padx=10)
 
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(top, textvariable=self.status_var).pack(side="right")
+
+        ttk.Label(
+            self,
+            text="Choose a save folder, close the game, then convert the slot you want to read.",
+            style="Hint.TLabel"
+        ).pack(fill="x", pady=(8, 0))
+
+        workspace_row = ttk.Frame(self)
+        workspace_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(workspace_row, text="Workspace Root:").pack(side="left")
+        self.choose_workspace_btn = ttk.Button(workspace_row, text="Choose Workspace Root", command=self.choose_workspace_root)
+        self.choose_workspace_btn.pack(side="left", padx=(8, 0))
+        self.default_workspace_btn = ttk.Button(workspace_row, text="Use Default", command=self.use_default_workspace_root)
+        self.default_workspace_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(workspace_row, textvariable=self.workspace_root_display, style="Path.TLabel").pack(
+            side="left", padx=10, fill="x", expand=True
+        )
+
+        ttk.Label(self, textvariable=self.workspace_mode_var, style="Hint.TLabel").pack(fill="x", pady=(4, 0))
+
+        platform_row = ttk.Frame(self)
+        platform_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(platform_row, text="Platform:").pack(side="left")
+        self.platform_combo = ttk.Combobox(
+            platform_row,
+            textvariable=self.platform_choice,
+            state="readonly",
+            width=16,
+            values=PLATFORM_LABELS
+        )
+        self.platform_combo.pack(side="left", padx=(8, 0))
+        ttk.Label(
+            platform_row,
+            text="Use Auto-detect for normal saves. Pick one manually if detection is unclear or you switch formats.",
+            style="Hint.TLabel"
+        ).pack(side="left", padx=12)
 
         mid = ttk.Frame(self)
         mid.pack(fill="x", pady=(10, 0))
@@ -965,13 +1452,25 @@ class ExportTab(ttk.Frame):
         self.ship_combo.pack(side="left", padx=8, fill="x", expand=True)
         self.ship_combo.bind("<<ComboboxSelected>>", self.on_ship_selected)
 
-        info = ttk.Frame(self)
-        info.pack(fill="x", pady=(10, 0))
-        ttk.Label(info, text="Decoded JSON (Work\\Export):").pack(side="left")
-        ttk.Label(info, textvariable=self.json_path).pack(side="left", padx=8)
+        details_bar = ttk.Frame(self)
+        details_bar.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            details_bar,
+            text="Show technical details",
+            variable=self.show_details_var,
+            command=self._toggle_details
+        ).pack(side="left")
+        ttk.Label(details_bar, textvariable=self.details_status_var, style="Hint.TLabel").pack(side="left", padx=(12, 0))
 
-        self.text = ScrolledText(self, wrap="none", height=24)
-        self.text.pack(fill="both", expand=True, pady=(10, 0))
+        self.details_frame = ttk.Labelframe(self, text="Technical Details")
+        details_info = ttk.Frame(self.details_frame)
+        details_info.pack(fill="x", pady=(0, 8))
+        ttk.Label(details_info, text="Decoded JSON (Work\\Export):").pack(side="left")
+        ttk.Label(details_info, textvariable=self.json_path_display, style="Path.TLabel").pack(
+            side="left", padx=8, fill="x", expand=True
+        )
+
+        self.text = ScrolledText(self.details_frame, wrap="none", height=24)
         self.text.configure(
             bg="#151515",
             fg="#e6e6e6",
@@ -979,13 +1478,20 @@ class ExportTab(ttk.Frame):
             selectbackground="#404040",
             selectforeground="#ffffff"
         )
+        self.text.pack(fill="both", expand=True)
+
+        self._refresh_workspace_root_display()
 
     def _set_busy(self, busy: bool, status: str | None = None):
         self._busy = busy
         if status is not None:
             self.status_var.set(status)
 
+        self.choose_folder_btn.config(state="disabled" if busy else "normal")
+        self.choose_workspace_btn.config(state="disabled" if busy else "normal")
+        self.default_workspace_btn.config(state="disabled" if busy else "normal")
         self.convert_btn.config(state="disabled" if busy else "normal")
+        self.platform_combo.config(state="disabled" if busy else "readonly")
         self.slot_combo.config(state="disabled" if busy else "readonly")
         self.ship_combo.config(state="disabled" if busy else "readonly")
 
@@ -1006,6 +1512,8 @@ class ExportTab(ttk.Frame):
         self.export_work_dir = d["export_work_dir"]
         self.import_work_dir = d["import_work_dir"]
         self.save_id = d["save_id"]
+        self.root_app.register_work_root(self.work_root)
+        self._refresh_workspace_root_display()
 
     def _clear_loaded_state(self):
         self.ship_bases = []
@@ -1014,14 +1522,89 @@ class ExportTab(ttk.Frame):
         self.ship_seeds = []
         self.last_loaded_root = None
         self.active_seed = ""
-        self.platform_format = "Steam"
+        self.platform_format = ""
         self.json_path.set("")
+        self.json_path_display.set("No converted JSON loaded.")
         self.ship_combo["values"] = []
         self.export_btn.config(state="disabled")
         self.text.delete("1.0", tk.END)
         self.status_var.set("Ready.")
         self.ship_combo.set("")
         self.ship_label_var.set("")
+        self._refresh_details_status()
+
+    def _refresh_details_status(self):
+        if self.show_details_var.get():
+            if self.json_path.get().strip():
+                self.details_status_var.set("Showing decoded Objects[] for the selected corvette.")
+            else:
+                self.details_status_var.set("Technical details will appear after a slot is loaded.")
+        else:
+            self.details_status_var.set("Technical details are hidden.")
+
+    def _toggle_details(self):
+        if self.show_details_var.get():
+            self.details_frame.pack(fill="both", expand=True, pady=(10, 0))
+        else:
+            self.details_frame.pack_forget()
+        self._refresh_details_status()
+
+    def _refresh_workspace_root_display(self):
+        current_save = self.save_folder.get().strip()
+        if current_save:
+            override = self.root_app.get_workspace_root_override()
+            preview = override or default_workspace_root_for_save(current_save)
+        elif self.tool_root:
+            preview = self.tool_root
+        else:
+            preview = self.root_app.get_workspace_root_override()
+
+        if preview:
+            self.workspace_root_display.set(short_display_path(preview))
+        else:
+            self.workspace_root_display.set("Choose a save folder to preview the default workspace root.")
+
+        if self.root_app.get_workspace_root_override():
+            self.workspace_mode_var.set("Custom workspace root is active for both tabs.")
+        else:
+            self.workspace_mode_var.set("Default workspace root lives next to the selected save folder.")
+
+    def choose_workspace_root(self):
+        current_save = self.save_folder.get().strip()
+        initial_dir = self.tool_root or self.root_app.get_workspace_root_override() or APP_DIR
+        folder = filedialog.askdirectory(title="Choose a workspace root for Backups, Builds, and Work", initialdir=initial_dir)
+        if folder:
+            persisted = self.root_app.set_workspace_root_override(folder)
+            if current_save:
+                d = ensure_tool_dirs_for_save(current_save, self.root_app.get_workspace_root_override())
+                self._set_workspace_from_dict(d)
+                self._clear_loaded_state()
+            else:
+                self.tool_root = os.path.abspath(folder)
+            self.root_app.refresh_workspace_views()
+            if not persisted:
+                messagebox.showwarning(
+                    "Settings not saved",
+                    "The workspace root changed for this session, but the app could not save the preference to disk.",
+                    parent=self
+                )
+
+    def use_default_workspace_root(self):
+        persisted = self.root_app.set_workspace_root_override("")
+        current_save = self.save_folder.get().strip()
+        if current_save:
+            d = ensure_tool_dirs_for_save(current_save, "")
+            self._set_workspace_from_dict(d)
+            self._clear_loaded_state()
+        else:
+            self.tool_root = ""
+        self.root_app.refresh_workspace_views()
+        if not persisted:
+            messagebox.showwarning(
+                "Settings not saved",
+                "The workspace root was reset for this session, but the app could not save the preference to disk.",
+                parent=self
+            )
 
     def _populate_slots(self, folder: str):
         self._slots = list_save_slots(folder)
@@ -1040,7 +1623,8 @@ class ExportTab(ttk.Frame):
         folder = filedialog.askdirectory(title="Select your NMS SAVE folder to EXPORT from")
         if folder:
             self.save_folder.set(folder)
-            d = ensure_tool_dirs_for_save(folder)
+            self.save_folder_display.set(short_display_path(folder))
+            d = ensure_tool_dirs_for_save(folder, self.root_app.get_workspace_root_override())
             self._set_workspace_from_dict(d)
             self._clear_loaded_state()
             self._populate_slots(folder)
@@ -1096,7 +1680,7 @@ class ExportTab(ttk.Frame):
             )
             return
 
-        d = ensure_tool_dirs_for_save(folder)
+        d = ensure_tool_dirs_for_save(folder, self.root_app.get_workspace_root_override())
         self._set_workspace_from_dict(d)
 
         if not pre_convert_warning_gate(self):
@@ -1113,7 +1697,7 @@ class ExportTab(ttk.Frame):
 
         def worker():
             try:
-                platform_format = detect_platform_format_from_savehg(folder, restore_file)
+                platform_format = resolve_platform_format(folder, restore_file, self.platform_choice.get())
                 self.after(0, lambda: self.status_var.set(
                     f"Detected: {platform_format} — Converting Slot {slot_num}…"
                 ))
@@ -1160,6 +1744,7 @@ class ExportTab(ttk.Frame):
                 def on_success():
                     self.platform_format = platform_format
                     self.json_path.set(out_json)
+                    self.json_path_display.set(short_display_path(out_json))
                     self.last_loaded_root = data
                     self.active_seed = active_seed
 
@@ -1173,6 +1758,7 @@ class ExportTab(ttk.Frame):
 
                     self.export_btn.config(state="normal")
                     self.on_ship_selected()
+                    self._refresh_details_status()
                     self._set_busy(False, "Ready.")
 
                 self.after(0, on_success)
@@ -1228,9 +1814,9 @@ class ExportTab(ttk.Frame):
 
         if not active_seed:
             ok = messagebox.askokcancel(
-                "Can’t verify active ship",
-                f"I couldn’t read the active ship seed from PrimaryShip/ShipOwnership in this JSON.\n\n"
-                f"Make sure the Corvette you’re about to {action_name.lower()} is NOT active.\n\nContinue?",
+                "Can't verify active ship",
+                f"I couldn't read the active ship seed from PrimaryShip/ShipOwnership in this JSON.\n\n"
+                f"Make sure the Corvette you're about to {action_name.lower()} is NOT active.\n\nContinue?",
                 parent=self
             )
             return ok
@@ -1305,8 +1891,15 @@ class ImportTab(ttk.Frame):
         self.root_app = root_app
 
         self.save_folder = tk.StringVar()
+        self.save_folder_display = tk.StringVar(value="No target save folder selected.")
         self.json_path = tk.StringVar()
+        self.json_path_display = tk.StringVar(value="No converted JSON loaded.")
         self.ship_label_var = tk.StringVar()
+        self.workspace_root_display = tk.StringVar()
+        self.workspace_mode_var = tk.StringVar()
+        self.details_status_var = tk.StringVar(value="Technical details are hidden.")
+        self.platform_choice = tk.StringVar(value="Auto-detect")
+        self.show_details_var = tk.BooleanVar(value=False)
 
         # SLOT state
         self.slot_label_var = tk.StringVar()
@@ -1319,7 +1912,7 @@ class ImportTab(ttk.Frame):
         self.ship_seeds = []
         self.last_loaded_root = None
         self.active_seed = ""
-        self.platform_format = "Steam"
+        self.platform_format = ""
 
         self.tool_root = ""
         self.backups_dir = ""
@@ -1334,17 +1927,54 @@ class ImportTab(ttk.Frame):
 
         self._busy = False
 
-        ttk.Button(top, text="Choose TARGET Save Folder (Import)", command=self.choose_folder).pack(side="left")
-        ttk.Label(top, textvariable=self.save_folder).pack(side="left", padx=10)
+        self.choose_folder_btn = ttk.Button(top, text="Choose TARGET Save Folder (Import)", command=self.choose_folder)
+        self.choose_folder_btn.pack(side="left")
+        ttk.Label(top, textvariable=self.save_folder_display, style="Path.TLabel").pack(side="left", padx=10, fill="x", expand=True)
 
         self.convert_btn = ttk.Button(top, text="Convert + Load Corvettes", command=self.convert_and_load)
         self.convert_btn.pack(side="left", padx=10)
 
-        self.import_btn = ttk.Button(top, text="Import Build (Replace)", command=self.import_into_selected, state="disabled")
+        self.import_btn = ttk.Button(top, text="Import Build (Replace)", command=self.import_into_selected, state="disabled", style="Accent.TButton")
         self.import_btn.pack(side="left", padx=10)
 
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(top, textvariable=self.status_var).pack(side="right")
+
+        ttk.Label(
+            self,
+            text="Choose the target save folder, close the game, then load the slot you want to overwrite.",
+            style="Hint.TLabel"
+        ).pack(fill="x", pady=(8, 0))
+
+        workspace_row = ttk.Frame(self)
+        workspace_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(workspace_row, text="Workspace Root:").pack(side="left")
+        self.choose_workspace_btn = ttk.Button(workspace_row, text="Choose Workspace Root", command=self.choose_workspace_root)
+        self.choose_workspace_btn.pack(side="left", padx=(8, 0))
+        self.default_workspace_btn = ttk.Button(workspace_row, text="Use Default", command=self.use_default_workspace_root)
+        self.default_workspace_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(workspace_row, textvariable=self.workspace_root_display, style="Path.TLabel").pack(
+            side="left", padx=10, fill="x", expand=True
+        )
+
+        ttk.Label(self, textvariable=self.workspace_mode_var, style="Hint.TLabel").pack(fill="x", pady=(4, 0))
+
+        platform_row = ttk.Frame(self)
+        platform_row.pack(fill="x", pady=(10, 0))
+        ttk.Label(platform_row, text="Platform:").pack(side="left")
+        self.platform_combo = ttk.Combobox(
+            platform_row,
+            textvariable=self.platform_choice,
+            state="readonly",
+            width=16,
+            values=PLATFORM_LABELS
+        )
+        self.platform_combo.pack(side="left", padx=(8, 0))
+        ttk.Label(
+            platform_row,
+            text="Use Auto-detect for normal saves. Pick one manually if detection is unclear or you switch formats.",
+            style="Hint.TLabel"
+        ).pack(side="left", padx=12)
 
         mid = ttk.Frame(self)
         mid.pack(fill="x", pady=(10, 0))
@@ -1367,13 +1997,25 @@ class ImportTab(ttk.Frame):
         self.ship_combo.pack(side="left", padx=8, fill="x", expand=True)
         self.ship_combo.bind("<<ComboboxSelected>>", self.on_ship_selected)
 
-        info = ttk.Frame(self)
-        info.pack(fill="x", pady=(10, 0))
-        ttk.Label(info, text="Decoded JSON (Work\\Import):").pack(side="left")
-        ttk.Label(info, textvariable=self.json_path).pack(side="left", padx=8)
+        details_bar = ttk.Frame(self)
+        details_bar.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            details_bar,
+            text="Show technical details",
+            variable=self.show_details_var,
+            command=self._toggle_details
+        ).pack(side="left")
+        ttk.Label(details_bar, textvariable=self.details_status_var, style="Hint.TLabel").pack(side="left", padx=(12, 0))
 
-        self.text = ScrolledText(self, wrap="none", height=24)
-        self.text.pack(fill="both", expand=True, pady=(10, 0))
+        self.details_frame = ttk.Labelframe(self, text="Technical Details")
+        details_info = ttk.Frame(self.details_frame)
+        details_info.pack(fill="x", pady=(0, 8))
+        ttk.Label(details_info, text="Decoded JSON (Work\\Import):").pack(side="left")
+        ttk.Label(details_info, textvariable=self.json_path_display, style="Path.TLabel").pack(
+            side="left", padx=8, fill="x", expand=True
+        )
+
+        self.text = ScrolledText(self.details_frame, wrap="none", height=24)
         self.text.configure(
             bg="#151515",
             fg="#e6e6e6",
@@ -1381,13 +2023,20 @@ class ImportTab(ttk.Frame):
             selectbackground="#404040",
             selectforeground="#ffffff"
         )
+        self.text.pack(fill="both", expand=True)
+
+        self._refresh_workspace_root_display()
 
     def _set_busy(self, busy: bool, status: str | None = None):
         self._busy = busy
         if status is not None:
             self.status_var.set(status)
 
+        self.choose_folder_btn.config(state="disabled" if busy else "normal")
+        self.choose_workspace_btn.config(state="disabled" if busy else "normal")
+        self.default_workspace_btn.config(state="disabled" if busy else "normal")
         self.convert_btn.config(state="disabled" if busy else "normal")
+        self.platform_combo.config(state="disabled" if busy else "readonly")
         self.slot_combo.config(state="disabled" if busy else "readonly")
         self.ship_combo.config(state="disabled" if busy else "readonly")
 
@@ -1411,6 +2060,8 @@ class ImportTab(ttk.Frame):
         self.export_work_dir = d["export_work_dir"]
         self.import_work_dir = d["import_work_dir"]
         self.save_id = d["save_id"]
+        self.root_app.register_work_root(self.work_root)
+        self._refresh_workspace_root_display()
 
     def _clear_loaded_state(self):
         self.ship_bases = []
@@ -1419,14 +2070,89 @@ class ImportTab(ttk.Frame):
         self.ship_seeds = []
         self.last_loaded_root = None
         self.active_seed = ""
-        self.platform_format = "Steam"
+        self.platform_format = ""
         self.json_path.set("")
+        self.json_path_display.set("No converted JSON loaded.")
         self.ship_combo["values"] = []
         self.import_btn.config(state="disabled")
         self.text.delete("1.0", tk.END)
         self.status_var.set("Ready.")
         self.ship_combo.set("")
         self.ship_label_var.set("")
+        self._refresh_details_status()
+
+    def _refresh_details_status(self):
+        if self.show_details_var.get():
+            if self.json_path.get().strip():
+                self.details_status_var.set("Showing decoded Objects[] for the selected target corvette.")
+            else:
+                self.details_status_var.set("Technical details will appear after a slot is loaded.")
+        else:
+            self.details_status_var.set("Technical details are hidden.")
+
+    def _toggle_details(self):
+        if self.show_details_var.get():
+            self.details_frame.pack(fill="both", expand=True, pady=(10, 0))
+        else:
+            self.details_frame.pack_forget()
+        self._refresh_details_status()
+
+    def _refresh_workspace_root_display(self):
+        current_save = self.save_folder.get().strip()
+        if current_save:
+            override = self.root_app.get_workspace_root_override()
+            preview = override or default_workspace_root_for_save(current_save)
+        elif self.tool_root:
+            preview = self.tool_root
+        else:
+            preview = self.root_app.get_workspace_root_override()
+
+        if preview:
+            self.workspace_root_display.set(short_display_path(preview))
+        else:
+            self.workspace_root_display.set("Choose a save folder to preview the default workspace root.")
+
+        if self.root_app.get_workspace_root_override():
+            self.workspace_mode_var.set("Custom workspace root is active for both tabs.")
+        else:
+            self.workspace_mode_var.set("Default workspace root lives next to the selected save folder.")
+
+    def choose_workspace_root(self):
+        current_save = self.save_folder.get().strip()
+        initial_dir = self.tool_root or self.root_app.get_workspace_root_override() or APP_DIR
+        folder = filedialog.askdirectory(title="Choose a workspace root for Backups, Builds, and Work", initialdir=initial_dir)
+        if folder:
+            persisted = self.root_app.set_workspace_root_override(folder)
+            if current_save:
+                d = ensure_tool_dirs_for_save(current_save, self.root_app.get_workspace_root_override())
+                self._set_workspace_from_dict(d)
+                self._clear_loaded_state()
+            else:
+                self.tool_root = os.path.abspath(folder)
+            self.root_app.refresh_workspace_views()
+            if not persisted:
+                messagebox.showwarning(
+                    "Settings not saved",
+                    "The workspace root changed for this session, but the app could not save the preference to disk.",
+                    parent=self
+                )
+
+    def use_default_workspace_root(self):
+        persisted = self.root_app.set_workspace_root_override("")
+        current_save = self.save_folder.get().strip()
+        if current_save:
+            d = ensure_tool_dirs_for_save(current_save, "")
+            self._set_workspace_from_dict(d)
+            self._clear_loaded_state()
+        else:
+            self.tool_root = ""
+        self.root_app.refresh_workspace_views()
+        if not persisted:
+            messagebox.showwarning(
+                "Settings not saved",
+                "The workspace root was reset for this session, but the app could not save the preference to disk.",
+                parent=self
+            )
 
     def _populate_slots(self, folder: str):
         self._slots = list_save_slots(folder)
@@ -1445,7 +2171,8 @@ class ImportTab(ttk.Frame):
         folder = filedialog.askdirectory(title="Select your TARGET NMS save folder to IMPORT into")
         if folder:
             self.save_folder.set(folder)
-            d = ensure_tool_dirs_for_save(folder)
+            self.save_folder_display.set(short_display_path(folder))
+            d = ensure_tool_dirs_for_save(folder, self.root_app.get_workspace_root_override())
             self._set_workspace_from_dict(d)
             self._clear_loaded_state()
             self._populate_slots(folder)
@@ -1500,7 +2227,7 @@ class ImportTab(ttk.Frame):
             )
             return
 
-        d = ensure_tool_dirs_for_save(folder)
+        d = ensure_tool_dirs_for_save(folder, self.root_app.get_workspace_root_override())
         self._set_workspace_from_dict(d)
 
         if not pre_convert_warning_gate(self):
@@ -1517,7 +2244,7 @@ class ImportTab(ttk.Frame):
 
         def worker():
             try:
-                platform_format = detect_platform_format_from_savehg(folder, restore_file)
+                platform_format = resolve_platform_format(folder, restore_file, self.platform_choice.get())
                 self.after(0, lambda: self.status_var.set(
                     f"Detected: {platform_format} — Converting Slot {slot_num}…"
                 ))
@@ -1564,6 +2291,7 @@ class ImportTab(ttk.Frame):
                 def on_success():
                     self.platform_format = platform_format
                     self.json_path.set(out_json)
+                    self.json_path_display.set(short_display_path(out_json))
                     self.last_loaded_root = data
                     self.active_seed = active_seed
 
@@ -1577,6 +2305,7 @@ class ImportTab(ttk.Frame):
 
                     self.import_btn.config(state="normal")
                     self.on_ship_selected()
+                    self._refresh_details_status()
                     self._set_busy(False, "Ready.")
 
                 self.after(0, on_success)
@@ -1632,9 +2361,9 @@ class ImportTab(ttk.Frame):
 
         if not active_seed:
             ok = messagebox.askokcancel(
-                "Can’t verify active ship",
-                f"I couldn’t read the active ship seed from PrimaryShip/ShipOwnership in this JSON.\n\n"
-                f"Make sure the Corvette you’re about to {action_name.lower()} is NOT active.\n\nContinue?",
+                "Can't verify active ship",
+                f"I couldn't read the active ship seed from PrimaryShip/ShipOwnership in this JSON.\n\n"
+                f"Make sure the Corvette you're about to {action_name.lower()} is NOT active.\n\nContinue?",
                 parent=self
             )
             return ok
@@ -1717,6 +2446,7 @@ class ImportTab(ttk.Frame):
         target_name = self.ship_names_only[idx] if idx < len(self.ship_names_only) else f"Corvette {idx+1}"
         meta_name = meta.get("name") if isinstance(meta, dict) else None
         meta_author = meta.get("author") if isinstance(meta, dict) else None
+        compat_mode = meta.get("compat_mode") if isinstance(meta, dict) else None
 
         slot_num = int(self._selected_slot["slot"])
         auto_file = self._selected_auto_file()
@@ -1735,6 +2465,10 @@ class ImportTab(ttk.Frame):
             summary_lines.append(f"Build name: {meta_name}")
         if meta_author:
             summary_lines.append(f"Author: {meta_author}")
+        if compat_mode == "raw-objects-list":
+            summary_lines.append("Build source: Compatibility input (raw Objects[] list)")
+        elif compat_mode == "Objects-wrapper":
+            summary_lines.append("Build source: Compatibility input (wrapper with 'Objects')")
 
         summary_lines += [
             "",
@@ -1748,7 +2482,11 @@ class ImportTab(ttk.Frame):
         if not messagebox.askokcancel("Import (Replace)", "\n".join(summary_lines), parent=self):
             return
 
-        backup_dir = mandatory_backup(folder, self.backups_dir)
+        try:
+            backup_dir = mandatory_backup(folder, self.backups_dir)
+        except Exception as e:
+            messagebox.showerror("Backup failed", str(e), parent=self)
+            return
 
         base = self.ship_bases[idx]
         parent, key = get_base_objects_ref(base)
@@ -1763,7 +2501,12 @@ class ImportTab(ttk.Frame):
 
         root_to_write = self.last_loaded_root
         work_dir = self.import_work_dir
-        platform_format = self.platform_format or detect_platform_format_from_savehg(folder, restore_file)
+        try:
+            platform_format = self.platform_format or resolve_platform_format(folder, restore_file, self.platform_choice.get())
+        except Exception as e:
+            self._set_busy(False, "Ready.")
+            messagebox.showerror("Platform required", str(e), parent=self)
+            return
         save_folder = folder
 
         def worker_write():
@@ -1828,5 +2571,233 @@ class ImportTab(ttk.Frame):
         threading.Thread(target=worker_write, daemon=True).start()
 
 
+def corvette_summary(root: dict) -> tuple[list[dict], str]:
+    ship_bases = find_player_ship_bases(root)
+    info_by_base_index = pair_bases_to_corvette_info(root, ship_bases)
+    primary_i = get_primary_ship_index(root)
+    active_res = get_shipownership_resource(root, primary_i) if primary_i is not None else {}
+    active_seed = resource_seed_hex(active_res).lower()
+
+    summary = []
+    for i, base in enumerate(ship_bases):
+        info = info_by_base_index.get(i, {})
+        name = info.get("name") or f"Corvette {i+1}"
+        seed = (info.get("seed") or "").lower()
+        objects = get_base_objects(base)
+        summary.append({
+            "index": i,
+            "name": name,
+            "seed": seed,
+            "object_count": len(objects),
+            "is_active": bool(seed and active_seed and seed == active_seed),
+        })
+
+    return summary, active_seed
+
+
+def choose_non_active_corvette(summary: list[dict]) -> dict:
+    for item in summary:
+        if not item.get("is_active") and int(item.get("object_count", 0)) > 0:
+            return item
+    raise RuntimeError("No non-active Corvette with Objects[] was found for this self-test.")
+
+
+def load_converted_root(folder: str, work_dir: str, save_id: str, slot_num: int, restore_file: str) -> tuple[str, dict]:
+    out_json = run_convert_savehg_to_json(folder, restore_file, work_dir, save_id, slot_num)
+    with open(out_json, "r", encoding="utf-8") as f:
+        return out_json, json.load(f)
+
+
+def hash_jsonable(value) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    import hashlib
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def restore_save_folder_from_backup(backup_dir: str, save_folder: str) -> int:
+    restored = 0
+    for name in os.listdir(backup_dir):
+        src_path = os.path.join(backup_dir, name)
+        dst_path = os.path.join(save_folder, name)
+        if os.path.isfile(src_path):
+            shutil.copy2(src_path, dst_path)
+            restored += 1
+    return restored
+
+
+def run_headless_self_test(source_save: str, target_save: str) -> dict:
+    source_save = os.path.abspath(source_save)
+    target_save = os.path.abspath(target_save)
+    restore_file = "save2.hg"
+    auto_file = "save.hg"
+    slot_num = 1
+
+    report: dict = {
+        "ok": False,
+        "source_save": source_save,
+        "target_save": target_save,
+        "steps": [],
+    }
+
+    source_dirs = ensure_tool_dirs_for_save(source_save)
+    target_dirs = ensure_tool_dirs_for_save(target_save)
+    backup_dir = ""
+    target_needs_restore = False
+
+    try:
+        source_platform = resolve_platform_format(source_save, restore_file, "Auto-detect")
+        target_platform = resolve_platform_format(target_save, restore_file, "Auto-detect")
+        report["source_platform"] = source_platform
+        report["target_platform"] = target_platform
+        report["steps"].append("platform_detection")
+
+        _, source_root = load_converted_root(source_save, source_dirs["export_work_dir"], source_dirs["save_id"], slot_num, restore_file)
+        source_summary, source_active_seed = corvette_summary(source_root)
+        report["source_corvettes"] = source_summary
+        report["source_active_seed"] = source_active_seed
+        report["steps"].append("source_convert")
+
+        active_matches = [item for item in source_summary if item.get("is_active")]
+        report["active_guard_checked"] = False
+        if len(active_matches) == 1:
+            active_item = active_matches[0]
+            guard_blocks = bool(source_active_seed and active_item.get("seed") == source_active_seed)
+            if not guard_blocks:
+                raise RuntimeError("Active Corvette detection succeeded, but the guard condition did not match it.")
+            report["active_guard_checked"] = True
+            report["active_corvette"] = active_item
+            report["steps"].append("active_guard")
+
+        source_pick = choose_non_active_corvette(source_summary)
+        source_bases = find_player_ship_bases(source_root)
+        source_objects = get_base_objects(source_bases[int(source_pick["index"])])
+        wrapper = build_wrapper(source_objects, f"Self Test Export - {source_pick['name']}", "EXE self-test")
+        build_path = os.path.join(source_dirs["builds_dir"], "exe-self-test-export.json")
+        with open(build_path, "w", encoding="utf-8") as f:
+            json.dump(wrapper, f, indent=2, ensure_ascii=False)
+        imported_objects, _meta = parse_build_file(build_path)
+        source_hash = hash_jsonable(imported_objects)
+        report["build_path"] = build_path
+        report["export_source"] = source_pick
+        report["export_hash"] = source_hash
+        report["steps"].append("export_build")
+
+        _, target_root_before = load_converted_root(target_save, target_dirs["import_work_dir"], target_dirs["save_id"], slot_num, restore_file)
+        target_summary_before, _target_active_seed = corvette_summary(target_root_before)
+        target_pick = choose_non_active_corvette(target_summary_before)
+        target_before = dict(target_pick)
+        target_before["objects_hash"] = hash_jsonable(
+            get_base_objects(find_player_ship_bases(target_root_before)[int(target_pick["index"])])
+        )
+        if target_before["objects_hash"] == source_hash:
+            raise RuntimeError("Target Corvette already matches the exported build; import self-test cannot prove a change.")
+        report["import_target_before"] = target_before
+        report["steps"].append("target_convert")
+
+        backup_dir = mandatory_backup(target_save, target_dirs["backups_dir"])
+        report["backup_dir"] = backup_dir
+        report["steps"].append("backup")
+
+        target_bases_before = find_player_ship_bases(target_root_before)
+        parent, key = get_base_objects_ref(target_bases_before[int(target_pick["index"])])
+        if parent is None:
+            raise RuntimeError("Could not locate Objects[] in the selected target Corvette during self-test.")
+        parent[key] = imported_objects
+        target_needs_restore = True
+
+        tmp_json = os.path.join(target_dirs["import_work_dir"], "_exe_self_test_modified_save.json")
+        with open(tmp_json, "w", encoding="utf-8") as f:
+            json.dump(target_root_before, f, ensure_ascii=False)
+        try:
+            convert_json_to_savehg(target_platform, tmp_json, target_save, target_dirs["import_work_dir"], restore_file)
+            convert_json_to_savehg(target_platform, tmp_json, target_save, target_dirs["import_work_dir"], auto_file)
+        finally:
+            try:
+                os.remove(tmp_json)
+            except Exception:
+                pass
+        report["steps"].append("import_write")
+
+        _, target_root_after = load_converted_root(target_save, target_dirs["import_work_dir"], target_dirs["save_id"], slot_num, restore_file)
+        target_bases_after = find_player_ship_bases(target_root_after)
+        post_objects = get_base_objects(target_bases_after[int(target_pick["index"])])
+        post_hash = hash_jsonable(post_objects)
+        if post_hash != source_hash:
+            raise RuntimeError("Imported target Corvette does not match the exported build hash.")
+        report["import_target_after"] = {
+            "index": int(target_pick["index"]),
+            "name": target_pick["name"],
+            "objects_hash": post_hash,
+            "object_count": len(post_objects),
+        }
+        report["steps"].append("import_verify")
+
+        restored_files = restore_save_folder_from_backup(backup_dir, target_save)
+        target_needs_restore = False
+        report["restored_files"] = restored_files
+
+        _, target_root_restored = load_converted_root(target_save, target_dirs["import_work_dir"], target_dirs["save_id"], slot_num, restore_file)
+        target_bases_restored = find_player_ship_bases(target_root_restored)
+        restored_objects = get_base_objects(target_bases_restored[int(target_pick["index"])])
+        restored_hash = hash_jsonable(restored_objects)
+        if restored_hash != target_before["objects_hash"]:
+            raise RuntimeError("Backup restore verification failed; the target save did not return to its original state.")
+        report["restore_hash"] = restored_hash
+        report["steps"].append("restore_verify")
+
+        clean_transient_work_root(source_dirs["work_root"])
+        clean_transient_work_root(target_dirs["work_root"])
+        report["steps"].append("work_cleanup")
+
+        report["ok"] = True
+        return report
+
+    except Exception as exc:
+        report["error"] = str(exc)
+        report["traceback"] = traceback.format_exc()
+        return report
+
+    finally:
+        if target_needs_restore and backup_dir and os.path.isdir(backup_dir):
+            try:
+                restore_save_folder_from_backup(backup_dir, target_save)
+            except Exception:
+                pass
+        clean_transient_work_root(source_dirs["work_root"])
+        clean_transient_work_root(target_dirs["work_root"])
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--self-test-source")
+    parser.add_argument("--self-test-target")
+    parser.add_argument("--self-test-report")
+    return parser.parse_known_args()
+
+
 if __name__ == "__main__":
+    args, _unknown = parse_cli_args()
+    if args.self_test_source or args.self_test_target or args.self_test_report:
+        report_path = args.self_test_report
+        report = {
+            "ok": False,
+            "error": "Missing self-test arguments.",
+        }
+        exit_code = 1
+
+        if args.self_test_source and args.self_test_target and report_path:
+            report = run_headless_self_test(args.self_test_source, args.self_test_target)
+            exit_code = 0 if report.get("ok") else 1
+
+        try:
+            report_dir = os.path.dirname(os.path.abspath(report_path))
+            if report_dir:
+                os.makedirs(report_dir, exist_ok=True)
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+        except Exception:
+            exit_code = 1
+
+        raise SystemExit(exit_code)
+
     App().mainloop()

@@ -1,13 +1,13 @@
 ---
-name: Testing feedback / Bug report
-about: Report issues, test results, or compatibility feedback
-title: "[TESTING] "
-labels: testing
+name: Bug report / Compatibility report
+about: Report bugs, regressions, or save compatibility issues
+title: "[BUG] "
+labels: bug
 assignees: ''
 ---
 
 ## Platform
-- Game version (Steam / GOG / Microsoft / Switch / PlayStation):
+- Save platform (Steam / GOG / Microsoft / Switch / PlayStation):
 - OS (Windows version):
 
 ## What were you trying to do?
@@ -19,7 +19,7 @@ What actually occurred?
 ## Expected behavior
 What did you expect to happen?
 
-## Did it work partially?
+## Outcome checklist
 - [ ] Export works
 - [ ] Import works
 - [ ] Save loads correctly

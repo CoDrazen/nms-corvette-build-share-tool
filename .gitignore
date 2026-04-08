@@ -1,0 +1,4 @@
+nms_corvette_tool_settings.json
+__pycache__/
+*.pyc
+build/
