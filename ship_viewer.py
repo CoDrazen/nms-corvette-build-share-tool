@@ -1,5 +1,6 @@
 import os
 import argparse
+import csv
 import re
 import json
 import shutil
@@ -830,18 +831,23 @@ def resource_seed_hex(res: dict) -> str:
 # -----------------------------
 
 def is_nms_running() -> bool:
-    possible = {"NMS.exe", "NoMansSky.exe", "NoMansSky", "NMS"}
+    possible = {"nms.exe", "nomanssky.exe"}
     try:
         startupinfo, creationflags = _windows_no_console_startupinfo()
         out = subprocess.check_output(
-            ["tasklist"],
+            ["tasklist", "/FO", "CSV", "/NH"],
             text=True,
             errors="ignore",
             startupinfo=startupinfo,
             creationflags=creationflags
         )
-        out_u = out.upper()
-        return any(p.upper() in out_u for p in possible)
+        for row in csv.reader(out.splitlines()):
+            if not row:
+                continue
+            image_name = (row[0] or "").strip().strip('"').lower()
+            if image_name in possible:
+                return True
+        return False
     except Exception:
         return False
 
