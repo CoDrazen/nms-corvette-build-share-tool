@@ -26,7 +26,7 @@ else:
 # App metadata + settings path
 APP_NAME = "NMS Corvette Build Share Tool"
 APP_VENDOR = "CoDrazen"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 def default_settings_dir() -> str:
@@ -855,6 +855,35 @@ def get_primary_ship_index(root: dict):
     return None
 
 
+def coerce_int_like(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if s and s.lstrip("+-").isdigit():
+            try:
+                return int(s, 10)
+            except Exception:
+                return None
+    return None
+
+
+def normalize_corvette_link_value(value) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
 def get_shipownership_list(root: dict) -> list:
     for path in (
         ["ShipOwnership"],
@@ -867,15 +896,96 @@ def get_shipownership_list(root: dict) -> list:
     return []
 
 
-def get_shipownership_resource(root: dict, idx: int) -> dict:
+def get_shipownership_entry(root: dict, idx: int) -> dict:
     ships = get_shipownership_list(root)
     if not isinstance(idx, int) or idx < 0 or idx >= len(ships):
         return {}
     ship = ships[idx]
-    if not isinstance(ship, dict):
-        return {}
+    return ship if isinstance(ship, dict) else {}
+
+
+def get_shipownership_resource(root: dict, idx: int) -> dict:
+    ship = get_shipownership_entry(root, idx)
     res = ship.get("Resource")
     return res if isinstance(res, dict) else {}
+
+
+def get_base_shipownership_index(base: dict):
+    for path in (
+        ["UserData"],
+        ["Base", "UserData"],
+        ["BaseData", "UserData"],
+    ):
+        value = deep_get(base, path) if len(path) > 1 else base.get(path[0])
+        idx = coerce_int_like(value)
+        if idx is not None:
+            return idx
+    return None
+
+
+def get_base_shipownership_link_value(base: dict) -> str:
+    for path in (
+        ["UserData"],
+        ["Base", "UserData"],
+        ["BaseData", "UserData"],
+    ):
+        value = deep_get(base, path) if len(path) > 1 else base.get(path[0])
+        normalized = normalize_corvette_link_value(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def get_shipownership_link_value(ship: dict) -> str:
+    for path in (
+        ["UserData"],
+        ["ShipData", "UserData"],
+        ["Data", "UserData"],
+    ):
+        value = deep_get(ship, path) if len(path) > 1 else ship.get(path[0])
+        normalized = normalize_corvette_link_value(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def find_shipownership_entry_for_base(root: dict, base: dict) -> tuple[dict, int | None, str]:
+    ship_i = get_base_shipownership_index(base)
+    if ship_i is not None:
+        ship = get_shipownership_entry(root, ship_i)
+        if ship:
+            return ship, ship_i, "userdata_index"
+
+    link_value = get_base_shipownership_link_value(base)
+    if link_value:
+        for i, ship in enumerate(get_shipownership_list(root)):
+            if not isinstance(ship, dict):
+                continue
+            if get_shipownership_link_value(ship) == link_value:
+                return ship, i, "userdata_value"
+
+    return {}, None, ""
+
+
+def get_active_ship_reference(root: dict) -> tuple[int | None, str]:
+    primary_i = get_primary_ship_index(root)
+    active_res = get_shipownership_resource(root, primary_i) if primary_i is not None else {}
+    active_seed = resource_seed_hex(active_res).lower()
+    return primary_i, active_seed
+
+
+def base_matches_active_ship(root: dict, base: dict, paired_seed: str = "") -> tuple[bool, int | None, int | None, str]:
+    primary_i, active_seed = get_active_ship_reference(root)
+    _ship, base_ship_i, _link_method = find_shipownership_entry_for_base(root, base)
+
+    if primary_i is not None and base_ship_i is not None:
+        return base_ship_i == primary_i, primary_i, base_ship_i, active_seed
+
+    fallback_seed = (paired_seed or "").lower()
+    if active_seed and fallback_seed:
+        return active_seed == fallback_seed, primary_i, base_ship_i, active_seed
+
+    return False, primary_i, base_ship_i, active_seed
 
 
 # -----------------------------
@@ -1035,7 +1145,31 @@ def format_corvette_display_name(nm: str, seed_hex: str) -> str:
     return f"Unnamed Corvette (Seed {seed_hex})"
 
 
-def pair_bases_to_corvette_info(root: dict, ship_bases: list[dict]) -> dict[int, dict]:
+def corvette_info_from_shipownership_entry(ship: dict):
+    if not looks_like_corvette_record(ship):
+        return None
+
+    nm_raw = ship.get("Name", "")
+    nm_raw = nm_raw if isinstance(nm_raw, str) else ""
+    seed_hex = deep_get(ship, ["Resource", "Seed"], default=[None, None])[1]
+    if not isinstance(seed_hex, str) or not seed_hex.lower().startswith("0x"):
+        return None
+
+    return {
+        "name": format_corvette_display_name(nm_raw, seed_hex),
+        "seed": seed_hex.lower(),
+    }
+
+
+def pair_bases_to_corvette_info_by_seed_heuristic(
+    root: dict,
+    ship_bases: list[dict],
+    excluded_base_indices: set[int] | None = None,
+    excluded_seed_keys: set[str] | None = None,
+) -> dict[int, dict]:
+    excluded_base_indices = set(excluded_base_indices or ())
+    excluded_seed_keys = {s.lower() for s in (excluded_seed_keys or set()) if isinstance(s, str) and s}
+
     raw_records = []
     walk_collect_corvette_records(root, raw_records)
 
@@ -1056,7 +1190,7 @@ def pair_bases_to_corvette_info(root: dict, ship_bases: list[dict]) -> dict[int,
         display_name = format_corvette_display_name(nm_raw, seed_hex)
 
         key = seed_hex.lower()
-        if key in seen:
+        if key in seen or key in excluded_seed_keys:
             continue
         seen.add(key)
 
@@ -1068,6 +1202,8 @@ def pair_bases_to_corvette_info(root: dict, ship_bases: list[dict]) -> dict[int,
 
     candidates = []
     for base_i, base_ts in enumerate(base_ts_list):
+        if base_i in excluded_base_indices:
+            continue
         for (display_name, seed_hex, seed_unix, prefixes, boost) in records:
             sc = score_match(base_ts, seed_unix, prefixes)
             if sc > 0:
@@ -1075,8 +1211,8 @@ def pair_bases_to_corvette_info(root: dict, ship_bases: list[dict]) -> dict[int,
 
     candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    assigned_base = set()
-    assigned_seed = set()
+    assigned_base = set(excluded_base_indices)
+    assigned_seed = set(excluded_seed_keys)
     mapping = {}
 
     for sc, boost, base_i, display_name, seed_hex in candidates:
@@ -1088,16 +1224,58 @@ def pair_bases_to_corvette_info(root: dict, ship_bases: list[dict]) -> dict[int,
         assigned_base.add(base_i)
         assigned_seed.add(seed_hex.lower())
 
+    return mapping
+
+
+def pair_bases_to_corvette_info(root: dict, ship_bases: list[dict]) -> dict[int, dict]:
+    mapping = {}
+    claimed_seeds = set()
+
+    for base_i, base in enumerate(ship_bases):
+        ship, ship_i, pairing_method = find_shipownership_entry_for_base(root, base)
+        if ship_i is None:
+            continue
+
+        info = corvette_info_from_shipownership_entry(ship)
+        if not info:
+            continue
+
+        mapping[base_i] = {
+            "name": info["name"],
+            "seed": info["seed"],
+            "ship_index": ship_i,
+            "pairing": pairing_method or "userdata_index",
+        }
+        claimed_seeds.add(info["seed"].lower())
+
+    fallback = pair_bases_to_corvette_info_by_seed_heuristic(
+        root,
+        ship_bases,
+        excluded_base_indices=set(mapping),
+        excluded_seed_keys=claimed_seeds,
+    )
+
+    for base_i, info in fallback.items():
+        if base_i not in mapping:
+            mapping[base_i] = {
+                "name": info["name"],
+                "seed": info["seed"],
+                "pairing": "seed_heuristic",
+            }
+
     if DEBUG_PAIRING:
         print("\n=== DEBUG: Corvette pairing ===")
-        print(f"Bases={len(ship_bases)} Records={len(records)} Candidates={len(candidates)}\n")
+        raw_records = []
+        walk_collect_corvette_records(root, raw_records)
+        print(f"Bases={len(ship_bases)} Records={len(raw_records)}\n")
         for i, b in enumerate(ship_bases):
             ga = b.get("GalacticAddress")
-            ts_count = len(base_ts_list[i])
+            _ship, ship_i, link_method = find_shipownership_entry_for_base(root, b)
             info = mapping.get(i)
             label = info["name"] if info else "<NO MATCH>"
             seed = info["seed"] if info else ""
-            print(f"Base[{i}] GA={ga} unix_ts_found={ts_count} -> {label} {seed}")
+            pairing = info.get("pairing", "") if info else ""
+            print(f"Base[{i}] GA={ga} ShipOwnership={ship_i} link={link_method} -> {label} {seed} {pairing}")
 
     return mapping
 
@@ -1718,9 +1896,7 @@ class ExportTab(ttk.Frame):
 
                 info_by_base_index = pair_bases_to_corvette_info(data, ship_bases)
 
-                primary_i = get_primary_ship_index(data)
-                active_res = get_shipownership_resource(data, primary_i) if primary_i is not None else {}
-                active_seed = resource_seed_hex(active_res)
+                _primary_i, active_seed = get_active_ship_reference(data)
 
                 labels, names_only, seeds = [], [], []
                 for i, b in enumerate(ship_bases):
@@ -1734,7 +1910,7 @@ class ExportTab(ttk.Frame):
                         seed = ""
 
                     obj_count = len(get_base_objects(b))
-                    is_active = (seed and active_seed and seed.lower() == active_seed.lower())
+                    is_active, _active_i, _base_ship_i, _active_seed = base_matches_active_ship(data, b, seed)
                     active_tag = " [ACTIVE]" if is_active else ""
 
                     labels.append(f"{i+1}. {nm}{active_tag}  (Objects: {obj_count})")
@@ -1798,30 +1974,29 @@ class ExportTab(ttk.Frame):
         if sel_i < 0 or sel_i >= len(self.ship_bases):
             return True
 
-        primary_i = get_primary_ship_index(self.last_loaded_root)
-        active_res = get_shipownership_resource(self.last_loaded_root, primary_i) if primary_i is not None else {}
-        active_seed = resource_seed_hex(active_res)
-
+        selected_base = self.ship_bases[sel_i]
         sel_seed = (self.ship_seeds[sel_i] or "").lower() if 0 <= sel_i < len(self.ship_seeds) else ""
+        is_active, active_i, sel_ship_i, active_seed = base_matches_active_ship(self.last_loaded_root, selected_base, sel_seed)
 
         if DEBUG_PAIRING:
             label = self.ship_names_only[sel_i] if sel_i < len(self.ship_names_only) else "<unknown>"
             print(f"\n=== DEBUG: Active-ship check ({action_name}) [EXPORT] ===")
             print("Selected:", label)
-            print("PrimaryShip index:", primary_i)
+            print("PrimaryShip index:", active_i)
+            print("Selected ship index:", sel_ship_i)
             print("Active seed:", active_seed)
             print("Selected seed:", sel_seed)
 
-        if not active_seed:
+        if active_i is None and not active_seed:
             ok = messagebox.askokcancel(
                 "Can't verify active ship",
-                f"I couldn't read the active ship seed from PrimaryShip/ShipOwnership in this JSON.\n\n"
+                f"I couldn't determine which Corvette is active from this converted save JSON.\n\n"
                 f"Make sure the Corvette you're about to {action_name.lower()} is NOT active.\n\nContinue?",
                 parent=self
             )
             return ok
 
-        if active_seed and sel_seed and active_seed == sel_seed:
+        if is_active:
             label = self.ship_names_only[sel_i] if sel_i < len(self.ship_names_only) else "Selected Corvette"
             messagebox.showwarning(
                 "Active ship detected",
@@ -2265,9 +2440,7 @@ class ImportTab(ttk.Frame):
 
                 info_by_base_index = pair_bases_to_corvette_info(data, ship_bases)
 
-                primary_i = get_primary_ship_index(data)
-                active_res = get_shipownership_resource(data, primary_i) if primary_i is not None else {}
-                active_seed = resource_seed_hex(active_res)
+                _primary_i, active_seed = get_active_ship_reference(data)
 
                 labels, names_only, seeds = [], [], []
                 for i, b in enumerate(ship_bases):
@@ -2281,7 +2454,7 @@ class ImportTab(ttk.Frame):
                         seed = ""
 
                     obj_count = len(get_base_objects(b))
-                    is_active = (seed and active_seed and seed.lower() == active_seed.lower())
+                    is_active, _active_i, _base_ship_i, _active_seed = base_matches_active_ship(data, b, seed)
                     active_tag = " [ACTIVE]" if is_active else ""
 
                     labels.append(f"{i+1}. {nm}{active_tag}  (Objects: {obj_count})")
@@ -2345,30 +2518,29 @@ class ImportTab(ttk.Frame):
         if sel_i < 0 or sel_i >= len(self.ship_bases):
             return True
 
-        primary_i = get_primary_ship_index(self.last_loaded_root)
-        active_res = get_shipownership_resource(self.last_loaded_root, primary_i) if primary_i is not None else {}
-        active_seed = resource_seed_hex(active_res)
-
+        selected_base = self.ship_bases[sel_i]
         sel_seed = (self.ship_seeds[sel_i] or "").lower() if 0 <= sel_i < len(self.ship_seeds) else ""
+        is_active, active_i, sel_ship_i, active_seed = base_matches_active_ship(self.last_loaded_root, selected_base, sel_seed)
 
         if DEBUG_PAIRING:
             label = self.ship_names_only[sel_i] if sel_i < len(self.ship_names_only) else "<unknown>"
             print(f"\n=== DEBUG: Active-ship check ({action_name}) [IMPORT] ===")
             print("Selected:", label)
-            print("PrimaryShip index:", primary_i)
+            print("PrimaryShip index:", active_i)
+            print("Selected ship index:", sel_ship_i)
             print("Active seed:", active_seed)
             print("Selected seed:", sel_seed)
 
-        if not active_seed:
+        if active_i is None and not active_seed:
             ok = messagebox.askokcancel(
                 "Can't verify active ship",
-                f"I couldn't read the active ship seed from PrimaryShip/ShipOwnership in this JSON.\n\n"
+                f"I couldn't determine which Corvette is active from this converted save JSON.\n\n"
                 f"Make sure the Corvette you're about to {action_name.lower()} is NOT active.\n\nContinue?",
                 parent=self
             )
             return ok
 
-        if active_seed and sel_seed and active_seed == sel_seed:
+        if is_active:
             label = self.ship_names_only[sel_i] if sel_i < len(self.ship_names_only) else "Selected Corvette"
             messagebox.showwarning(
                 "Active ship detected",
@@ -2571,12 +2743,10 @@ class ImportTab(ttk.Frame):
         threading.Thread(target=worker_write, daemon=True).start()
 
 
-def corvette_summary(root: dict) -> tuple[list[dict], str]:
+def corvette_summary(root: dict) -> tuple[list[dict], int | None, str]:
     ship_bases = find_player_ship_bases(root)
     info_by_base_index = pair_bases_to_corvette_info(root, ship_bases)
-    primary_i = get_primary_ship_index(root)
-    active_res = get_shipownership_resource(root, primary_i) if primary_i is not None else {}
-    active_seed = resource_seed_hex(active_res).lower()
+    primary_i, active_seed = get_active_ship_reference(root)
 
     summary = []
     for i, base in enumerate(ship_bases):
@@ -2584,15 +2754,21 @@ def corvette_summary(root: dict) -> tuple[list[dict], str]:
         name = info.get("name") or f"Corvette {i+1}"
         seed = (info.get("seed") or "").lower()
         objects = get_base_objects(base)
+        base_ship_i = info.get("ship_index")
+        if base_ship_i is None:
+            _ship, base_ship_i, _pairing = find_shipownership_entry_for_base(root, base)
+        is_active, _active_i, _base_ship_i, _active_seed = base_matches_active_ship(root, base, seed)
         summary.append({
             "index": i,
             "name": name,
             "seed": seed,
+            "shipownership_index": base_ship_i,
+            "pairing_method": info.get("pairing") or "",
             "object_count": len(objects),
-            "is_active": bool(seed and active_seed and seed == active_seed),
+            "is_active": is_active,
         })
 
-    return summary, active_seed
+    return summary, primary_i, active_seed
 
 
 def choose_non_active_corvette(summary: list[dict]) -> dict:
@@ -2652,8 +2828,9 @@ def run_headless_self_test(source_save: str, target_save: str) -> dict:
         report["steps"].append("platform_detection")
 
         _, source_root = load_converted_root(source_save, source_dirs["export_work_dir"], source_dirs["save_id"], slot_num, restore_file)
-        source_summary, source_active_seed = corvette_summary(source_root)
+        source_summary, source_active_index, source_active_seed = corvette_summary(source_root)
         report["source_corvettes"] = source_summary
+        report["source_active_ship_index"] = source_active_index
         report["source_active_seed"] = source_active_seed
         report["steps"].append("source_convert")
 
@@ -2661,7 +2838,12 @@ def run_headless_self_test(source_save: str, target_save: str) -> dict:
         report["active_guard_checked"] = False
         if len(active_matches) == 1:
             active_item = active_matches[0]
-            guard_blocks = bool(source_active_seed and active_item.get("seed") == source_active_seed)
+            guard_blocks = False
+            active_item_index = active_item.get("shipownership_index")
+            if source_active_index is not None and active_item_index is not None:
+                guard_blocks = int(active_item_index) == int(source_active_index)
+            elif source_active_seed and active_item.get("seed"):
+                guard_blocks = active_item.get("seed") == source_active_seed
             if not guard_blocks:
                 raise RuntimeError("Active Corvette detection succeeded, but the guard condition did not match it.")
             report["active_guard_checked"] = True
@@ -2683,7 +2865,7 @@ def run_headless_self_test(source_save: str, target_save: str) -> dict:
         report["steps"].append("export_build")
 
         _, target_root_before = load_converted_root(target_save, target_dirs["import_work_dir"], target_dirs["save_id"], slot_num, restore_file)
-        target_summary_before, _target_active_seed = corvette_summary(target_root_before)
+        target_summary_before, _target_active_index, _target_active_seed = corvette_summary(target_root_before)
         target_pick = choose_non_active_corvette(target_summary_before)
         target_before = dict(target_pick)
         target_before["objects_hash"] = hash_jsonable(
